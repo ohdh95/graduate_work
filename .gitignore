@@ -1,0 +1,22 @@
+# VM and disk images
+*.qcow2
+*.img
+*.iso
+
+# Build outputs
+Cylon/CylonFEMU/build-femu/
+Cylon/CylonLinux/.config
+Cylon/CylonLinux/*.deb
+
+# Raw experiment data
+results/raw/*
+!results/raw/.gitkeep
+
+# Future datasets and indexes
+datasets/
+indexes/
+
+# Runtime files
+*.log
+core
+core.*

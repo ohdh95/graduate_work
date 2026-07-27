@@ -1,0 +1,7 @@
+Cylon Linux kernel
+============
+
+## How to build
+```sh
+./compile.sh
+```

@@ -1,0 +1,1 @@
+gcc -o cxl_warmup cxl_warmup.c -fopenmp
