@@ -4425,6 +4425,8 @@ int kvm_vm_ioctl_check_extension(struct kvm *kvm, long ext)
 	int r = 0;
 
 	switch (ext) {
+	case KVM_CAP_CYLON_PREFETCH_EXIT:
+		return 1;
 	case KVM_CAP_IRQCHIP:
 	case KVM_CAP_HLT:
 	case KVM_CAP_MMU_SHADOW_CACHE_CONTROL:
@@ -8851,12 +8853,38 @@ int x86_decode_emulated_instruction(struct kvm_vcpu *vcpu, int emulation_type,
 }
 EXPORT_SYMBOL_GPL(x86_decode_emulated_instruction);
 
+static int complete_cylon_prefetch_singlestep(struct kvm_vcpu *vcpu)
+{
+	/* RIP was committed before the notification exit; deliver only #DB. */
+	return kvm_vcpu_do_singlestep(vcpu);
+}
+
+static bool is_cylon_prefetch_exit(struct kvm_vcpu *vcpu,
+				   struct x86_emulate_ctxt *ctxt,
+				   gpa_t fault_gpa, int emulation_type)
+{
+	struct kvm_memory_slot *slot;
+
+	/* Only 0f 18 /0..3 with a memory operand are architectural hints. */
+	if (!(emulation_type & EMULTYPE_PF) ||
+	    !vcpu->arch.mmu->root_role.direct ||
+	    ctxt->opcode_len != 2 || ctxt->b != 0x18 ||
+	    ctxt->modrm_mod == 3 || ctxt->modrm_reg > 3)
+		return false;
+
+	slot = kvm_vcpu_gfn_to_memslot(vcpu, gpa_to_gfn(fault_gpa));
+	return slot &&
+	       (slot->flags & KVM_MEMSLOT_DUAL_MODE) &&
+	       (slot->flags & KVM_MEMSLOT_CYLON_PREFETCH);
+}
+
 int x86_emulate_instruction(struct kvm_vcpu *vcpu, gpa_t cr2_or_gpa,
 			    int emulation_type, void *insn, int insn_len)
 {
 	int r;
 	struct x86_emulate_ctxt *ctxt = vcpu->arch.emulate_ctxt;
 	bool writeback = true;
+	bool cylon_prefetch = false;
 
 	if (unlikely(!kvm_can_emulate_insn(vcpu, emulation_type, insn, insn_len)))
 		return 1;
@@ -8922,6 +8950,9 @@ int x86_emulate_instruction(struct kvm_vcpu *vcpu, gpa_t cr2_or_gpa,
 			}
 			return handle_emulation_failure(vcpu, emulation_type);
 		}
+
+		cylon_prefetch = is_cylon_prefetch_exit(vcpu, ctxt, cr2_or_gpa,
+						  emulation_type);
 	}
 
 	if ((emulation_type & EMULTYPE_VMWARE_GP) &&
@@ -9016,6 +9047,20 @@ restart:
 			writeback = false;
 		r = 0;
 		vcpu->arch.complete_userspace_io = complete_emulated_mmio;
+	} else if (cylon_prefetch) {
+		/*
+		 * PREFETCH has architecturally completed.  Commit RIP below, but
+		 * notify userspace once so it can enqueue a response-free CXL fill.
+		 */
+		vcpu->run->exit_reason = KVM_EXIT_CYLON_PREFETCH;
+		vcpu->run->cylon_prefetch.phys_addr = cr2_or_gpa;
+		vcpu->run->cylon_prefetch.hint = ctxt->modrm_reg;
+		memset(vcpu->run->cylon_prefetch.pad, 0,
+		       sizeof(vcpu->run->cylon_prefetch.pad));
+		if (ctxt->tf || (vcpu->guest_debug & KVM_GUESTDBG_SINGLESTEP))
+			vcpu->arch.complete_userspace_io =
+				complete_cylon_prefetch_singlestep;
+		r = 0;
 	} else if (vcpu->arch.complete_userspace_io) {
 		writeback = false;
 		r = 0;

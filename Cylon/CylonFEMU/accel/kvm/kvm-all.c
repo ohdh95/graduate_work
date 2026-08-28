@@ -48,6 +48,9 @@
 #include "kvm-cpus.h"
 #include "sysemu/dirtylimit.h"
 #include "qemu/range.h"
+#ifdef CONFIG_FEMU_PCI
+#include "hw/femu/kvm_ext.h"
+#endif
 
 #include "hw/boards.h"
 #include "sysemu/stats.h"
@@ -3052,6 +3055,27 @@ int kvm_cpu_exec(CPUState *cpu)
                              run->mmio.data,
                              run->mmio.len,
                              run->mmio.is_write);
+            ret = 0;
+            break;
+        case KVM_EXIT_CYLON_PREFETCH:
+            DPRINTF("handle_cylon_prefetch\n");
+            /*
+             * KVM has already completed the architectural PREFETCH hint.
+             * Dispatch directly to the registered Cylon device.  A generic
+             * address-space read could accidentally trigger an unrelated
+             * MMIO device if the private KVM/QEMU topology drifted.
+             */
+#ifdef CONFIG_FEMU_PCI
+            if (femu_kvm_dispatch_cylon_prefetch(
+                    run->cylon_prefetch.phys_addr,
+                    run->cylon_prefetch.hint) != MEMTX_OK) {
+                error_report_once(
+                    "KVM Cylon prefetch exit targeted no active CXL-SSD");
+            }
+#else
+            error_report_once(
+                "KVM Cylon prefetch exit requires CONFIG_FEMU_PCI");
+#endif
             ret = 0;
             break;
         case KVM_EXIT_IRQ_WINDOW_OPEN:

@@ -275,6 +275,8 @@ static void nvme_init_poller(FemuCtrl *n)
     n->poller = g_malloc0(sizeof(QemuThread) * (n->nr_pollers + 1));
     NvmePollerThreadArgument *args = malloc(sizeof(NvmePollerThreadArgument) *
                                             (n->nr_pollers + 1));
+    qatomic_set(&n->poller_on, true);
+    n->pollers_joined = false;
     for (i = 1; i <= n->nr_pollers; i++) {
         args[i].n = n;
         args[i].index = i;

@@ -45,6 +45,9 @@ tests = {
     meson.project_source_root() / 'hw/femu/cxlssd/cxl-request-lifetime.c',
     meson.project_source_root() / 'hw/femu/lib/rte_ring.c',
   ],
+  'test-femu-cxl-async-fill': [
+    meson.project_source_root() / 'hw/femu/cxlssd/cxl-async-fill.c',
+  ],
   'check-qom-interface': [qom],
   'check-qom-proplist': [qom],
   'test-qemu-opts': [],

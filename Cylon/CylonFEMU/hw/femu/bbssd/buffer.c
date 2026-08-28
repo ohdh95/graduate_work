@@ -291,6 +291,25 @@ void buffer_clear(struct buffer *buffer)
 	qatomic_set(&buffer->cxl_mapped_nand_reads, 0);
 	qatomic_set(&buffer->cxl_unmapped_read_alloc_writes, 0);
 	qatomic_set(&buffer->cxl_modeled_nand_wait_ns, 0);
+	qatomic_set(&buffer->cxl_sw_prefetch_callbacks, 0);
+	qatomic_set(&buffer->cxl_sw_prefetch_enqueued, 0);
+	qatomic_set(&buffer->cxl_sw_prefetch_processed, 0);
+	qatomic_set(&buffer->cxl_sw_prefetch_dropped, 0);
+	qatomic_set(&buffer->cxl_sw_prefetch_admission_drops, 0);
+	qatomic_set(&buffer->cxl_sw_prefetch_queue_full_drops, 0);
+	qatomic_set(&buffer->cxl_sw_prefetch_outstanding_limit_drops, 0);
+	qatomic_set(&buffer->cxl_sw_prefetch_invalid_drops, 0);
+	qatomic_set(&buffer->cxl_sw_prefetch_unmapped_drops, 0);
+	qatomic_set(&buffer->cxl_sw_prefetch_inflight_cap_drops, 0);
+	qatomic_set(&buffer->cxl_sw_prefetch_hits, 0);
+	qatomic_set(&buffer->cxl_sw_prefetch_deduplicated, 0);
+	qatomic_set(&buffer->cxl_sw_prefetch_nand_reads, 0);
+	qatomic_set(&buffer->cxl_demand_inflight_joins, 0);
+	qatomic_set(&buffer->cxl_demand_joined_prefetch_fill, 0);
+	qatomic_set(&buffer->cxl_demand_joined_demand_fill, 0);
+	qatomic_set(&buffer->cxl_prefetch_unjoined_completions, 0);
+	qatomic_set(&buffer->cxl_async_fill_completions, 0);
+	qatomic_set(&buffer->cxl_async_inflight_peak, 0);
 }
 
 void buffer_init_set(struct buffer* buffer)

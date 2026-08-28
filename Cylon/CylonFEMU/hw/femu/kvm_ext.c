@@ -10,9 +10,62 @@ static struct kvm_memslot_get_linear_spt spt;
 struct kvm_userspace_memory_region mem;
 
 static bool init = false;
+static pthread_mutex_t cylon_dispatch_gate = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t cylon_dispatch_idle = PTHREAD_COND_INITIALIZER;
+static bool cylon_dispatch_registered;
+static uint64_t cylon_dispatch_active;
 
 FILE *pagemap = NULL;
 FemuCtrl *femu = NULL;
+
+int femu_kvm_cylon_prefetch_abi_version(void)
+{
+    int version;
+
+    if (!kvm_enabled() || !kvm_state) {
+        return 0;
+    }
+    version = kvm_ioctl(kvm_state, KVM_CHECK_EXTENSION,
+                        KVM_CAP_CYLON_PREFETCH_EXIT);
+
+    return version < 0 ? 0 : version;
+}
+
+MemTxResult femu_kvm_dispatch_cylon_prefetch(uint64_t gpa, uint8_t hint)
+{
+    MemTxAttrs attrs = MEMTXATTRS_UNSPECIFIED;
+    uint64_t discard = 0;
+    FemuCtrl *n;
+    MemTxResult result;
+
+    pthread_mutex_lock(&cylon_dispatch_gate);
+    if (!cylon_dispatch_registered || !femu) {
+        pthread_mutex_unlock(&cylon_dispatch_gate);
+        return MEMTX_ERROR;
+    }
+    n = femu;
+    cylon_dispatch_active++;
+    pthread_mutex_unlock(&cylon_dispatch_gate);
+
+    if (!n->mbe || !n->cxl_async_sw_prefetch || !n->cxl_mem_ops.read ||
+        gpa < n->base_gpa || gpa - n->base_gpa >= n->mbe->size) {
+        result = MEMTX_ERROR;
+        goto out;
+    }
+
+    /* All x86 PREFETCH hint variants request the same page-level NAND fill. */
+    (void)hint;
+    attrs.cylon_prefetch = 1;
+    result = n->cxl_mem_ops.read(n, gpa - n->base_gpa, &discard, 1, attrs);
+
+out:
+    pthread_mutex_lock(&cylon_dispatch_gate);
+    if (--cylon_dispatch_active == 0) {
+        pthread_cond_broadcast(&cylon_dispatch_idle);
+    }
+    pthread_mutex_unlock(&cylon_dispatch_gate);
+    return result;
+}
 
 static int init_spt(struct kvm_userspace_memory_region mem)
 {
@@ -248,6 +301,9 @@ static struct kvm_userspace_memory_region femu_get_memory_region(FemuCtrl *n)
     m.guest_phys_addr = n->base_gpa;
     m.userspace_addr = (uint64_t)b->buf_space;
     m.flags = KVM_MEMSLOT_DUAL_MODE;
+    if (n->cxl_async_sw_prefetch) {
+        m.flags |= KVM_MEMSLOT_CYLON_PREFETCH;
+    }
     // mem.flags = 0;
     m.memory_size = b->size;
 
@@ -273,7 +329,10 @@ int femu_kvm_set_user_memory_region(FemuCtrl *n)
     }
 
     init_spt(mem);
+    pthread_mutex_lock(&cylon_dispatch_gate);
     init = true;
+    cylon_dispatch_registered = true;
+    pthread_mutex_unlock(&cylon_dispatch_gate);
 
     return ret;
 }
@@ -284,10 +343,27 @@ int femu_kvm_del_user_memory_region(FemuCtrl *n)
     struct kvm_userspace_memory_region mem = femu_get_memory_region(n);
     int ret;
 
+    /* Reject new custom exits and wait for every in-progress callback. */
+    pthread_mutex_lock(&cylon_dispatch_gate);
+    cylon_dispatch_registered = false;
+    while (cylon_dispatch_active) {
+        pthread_cond_wait(&cylon_dispatch_idle, &cylon_dispatch_gate);
+    }
+    pthread_mutex_unlock(&cylon_dispatch_gate);
+
+    /* KVM removes a memslot only when memory_size is zero. */
+    mem.memory_size = 0;
+    mem.userspace_addr = 0;
+    mem.flags = 0;
     ret = kvm_vm_ioctl(s, KVM_SET_USER_MEMORY_REGION, &mem);
     if (ret < 0) {
-        printf("FEMU kvm ioctl error\n");
+        femu_err("failed to remove Cylon KVM memslot: %d\n", ret);
+        abort();
     }
+    pthread_mutex_lock(&cylon_dispatch_gate);
+    init = false;
+    femu = NULL;
+    pthread_mutex_unlock(&cylon_dispatch_gate);
     return ret;
 }
 

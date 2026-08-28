@@ -1,4 +1,6 @@
 #include "ftl.h"
+#include "../cxlssd/cxl-async-fill.h"
+#include "qemu/processor.h"
 #include <sys/syscall.h>
 
 //#define FEMU_DEBUG_FTL
@@ -460,6 +462,25 @@ static void buffer_init(struct ssd *ssd)
     buffer->cxl_mapped_nand_reads = 0;
     buffer->cxl_unmapped_read_alloc_writes = 0;
     buffer->cxl_modeled_nand_wait_ns = 0;
+    buffer->cxl_sw_prefetch_callbacks = 0;
+    buffer->cxl_sw_prefetch_enqueued = 0;
+    buffer->cxl_sw_prefetch_processed = 0;
+    buffer->cxl_sw_prefetch_dropped = 0;
+    buffer->cxl_sw_prefetch_admission_drops = 0;
+    buffer->cxl_sw_prefetch_queue_full_drops = 0;
+    buffer->cxl_sw_prefetch_outstanding_limit_drops = 0;
+    buffer->cxl_sw_prefetch_invalid_drops = 0;
+    buffer->cxl_sw_prefetch_unmapped_drops = 0;
+    buffer->cxl_sw_prefetch_inflight_cap_drops = 0;
+    buffer->cxl_sw_prefetch_hits = 0;
+    buffer->cxl_sw_prefetch_deduplicated = 0;
+    buffer->cxl_sw_prefetch_nand_reads = 0;
+    buffer->cxl_demand_inflight_joins = 0;
+    buffer->cxl_demand_joined_prefetch_fill = 0;
+    buffer->cxl_demand_joined_demand_fill = 0;
+    buffer->cxl_prefetch_unjoined_completions = 0;
+    buffer->cxl_async_fill_completions = 0;
+    buffer->cxl_async_inflight_peak = 0;
 
 	switch (buffer->policy)
 	{
@@ -536,6 +557,7 @@ void ssd_init(FemuCtrl *n)
     if (n->bufsz)
         ssd_init_buffer(n);
     printf("\n###########\b, read_lat: %d\n", ssd->sp.pg_rd_lat);
+    qatomic_set(&ssd->ftl_should_stop, false);
     qemu_thread_create(&ssd->ftl_thread, "FEMU-FTL-Thread", ftl_thread, n,
                        QEMU_THREAD_JOINABLE);
 }
@@ -543,6 +565,13 @@ void ssd_init(FemuCtrl *n)
 void ssd_reset(FemuCtrl *n)
 {
     struct ssd *ssd = n->ssd;
+
+    qatomic_set(&ssd->ftl_should_stop, true);
+    qemu_thread_join(&ssd->ftl_thread);
+    if (qatomic_read(&n->cxl_prefetch_outstanding) != 0) {
+        ftl_err("CXL prefetch requests remain outstanding at shutdown\n");
+        abort();
+    }
     buffer_clear(&ssd->dram_buffer);
 
     /* Todo: Free malloced ssd internals*/
@@ -1135,6 +1164,120 @@ static uint64_t ssd_write(struct ssd *ssd, NvmeRequest *req)
 //     return maxlat;
 // }
 
+static void release_cxl_prefetch_token(FemuCtrl *n)
+{
+    uint32_t previous = qatomic_fetch_dec(&n->cxl_prefetch_outstanding);
+
+    if (previous == 0) {
+        ftl_err("CXL prefetch outstanding counter underflow\n");
+        abort();
+    }
+}
+
+static void complete_cxl_fill(FemuCtrl *n, struct buffer *buffer,
+                              CylonCxlFill *fill)
+{
+    struct buffer_entry *bentry = buffer_lookup_entry(buffer, fill->lpn);
+    struct cxl_req *waiter;
+
+    /*
+     * INFLIGHT pages are deliberately absent from the resident GTree and
+     * retain an MMIO SPTE.  Only publish the Direct SPTE after ready_time.
+     * A device Next-N fill may have made the page resident meanwhile; avoid
+     * inserting a duplicate in that legacy mode.
+     */
+    if (!bentry) {
+        bentry = buffer_entry_init(buffer, fill->lpn);
+        if (!bentry) {
+            ftl_err("failed to allocate completed CXL fill for lpn=%" PRIu64
+                    "\n", fill->lpn);
+            abort();
+        }
+        bentry->dirty = fill->dirty;
+        buffer_insert_entry(
+            buffer, bentry,
+            (!n->cxl_async_sw_prefetch && !fill->prefetch_origin) ?
+                INSERT_PREFETCH : INSERT_NO_PREFETCH);
+    } else {
+        bentry->dirty = bentry->dirty || fill->dirty;
+        buffer_insert_entry(buffer, bentry, INSERT_NO_PREFETCH);
+    }
+
+    if (fill->prefetch_origin && !fill->demand_joined) {
+        qatomic_inc(&buffer->cxl_prefetch_unjoined_completions);
+    }
+    if (fill->holds_prefetch_token) {
+        release_cxl_prefetch_token(n);
+    }
+    qatomic_inc(&buffer->cxl_async_fill_completions);
+    while ((waiter = cylon_cxl_fill_pop_waiter(fill))) {
+        complete_cxl_req(waiter);
+    }
+    cylon_cxl_fill_free(fill);
+}
+
+static void complete_ready_cxl_fills(FemuCtrl *n, struct buffer *buffer,
+                                     CylonCxlFillTracker *tracker)
+{
+    uint64_t now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+    CylonCxlFill *fill;
+
+    while ((fill = cylon_cxl_fill_pop_ready(tracker, now))) {
+        complete_cxl_fill(n, buffer, fill);
+        now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+    }
+}
+
+static void drain_cxl_fills(FemuCtrl *n, struct buffer *buffer,
+                            CylonCxlFillTracker *tracker)
+{
+    while (cylon_cxl_fill_peek(tracker)) {
+        CylonCxlFill *next;
+        uint64_t now;
+
+        complete_ready_cxl_fills(n, buffer, tracker);
+        next = cylon_cxl_fill_peek(tracker);
+        if (!next) {
+            break;
+        }
+        now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+        if (next->ready_time_ns > now + 1000) {
+            uint64_t delay_us = (next->ready_time_ns - now + 999) / 1000;
+
+            g_usleep(MIN(delay_us, 1000));
+        } else {
+            cpu_relax();
+        }
+    }
+}
+
+static void update_cxl_inflight_peak(struct buffer *buffer,
+                                     const CylonCxlFillTracker *tracker)
+{
+    uint64_t current = qatomic_read(&buffer->cxl_async_inflight_peak);
+
+    while (current < tracker->peak) {
+        uint64_t observed = qatomic_cmpxchg(
+            &buffer->cxl_async_inflight_peak, current, tracker->peak);
+
+        if (observed == current) {
+            break;
+        }
+        current = observed;
+    }
+}
+
+static bool nvme_to_ftl_rings_empty(const FemuCtrl *n)
+{
+    int i;
+
+    for (i = 1; i <= n->nr_pollers; ++i) {
+        if (n->to_ftl[i] && femu_ring_count(n->to_ftl[i])) {
+            return false;
+        }
+    }
+    return true;
+}
 
 static void *ftl_thread(void *arg)
 {
@@ -1144,11 +1287,16 @@ static void *ftl_thread(void *arg)
     uint64_t lat = 0;
     int rc;
     int i;
+    CylonCxlFillTracker fills;
+    bool prefer_prefetch = true;
 
     femu_log("FEMU-FTL-Thread-TID: %ld\n", syscall(SYS_gettid));
     fflush(stdout);
 
-    while (!*(ssd->dataplane_started_ptr)) {
+    cylon_cxl_fill_tracker_init(&fills);
+
+    while (!*(ssd->dataplane_started_ptr) &&
+           !qatomic_read(&ssd->ftl_should_stop)) {
         usleep(100000);
     }
 
@@ -1157,27 +1305,63 @@ static void *ftl_thread(void *arg)
     ssd->to_poller = n->to_poller;
 
     ssd->cxl_req = n->cxl_req;
+    ssd->cxl_prefetch_req = n->cxl_prefetch_req;
 
     struct buffer *buffer = &ssd->dram_buffer;
 #ifdef LSA_TROLL    
     bool skip = false;
 #endif
-    bool read = false;
     // FILE *f = fopen("/home/necsst/cxlssd_io.log", "a");
     while (1) {
+        complete_ready_cxl_fills(n, buffer, &fills);
+
+        if (qatomic_read(&ssd->ftl_should_stop) &&
+            (!ssd->cxl_req || !femu_ring_count(ssd->cxl_req)) &&
+            (!ssd->cxl_prefetch_req ||
+             !femu_ring_count(ssd->cxl_prefetch_req)) &&
+            fills.count == 0 && nvme_to_ftl_rings_empty(n)) {
+            break;
+        }
+
         if (n->femu_mode == FEMU_CXLSSD_MODE) {
             // if (buffer_force_eviction(buffer))
             // {
             //     evict_victim(ssd);
             // }
 
-            if (ssd->cxl_req && femu_ring_count(ssd->cxl_req)) {
+            struct rte_ring *cxl_ring = NULL;
+
+            bool demand_pending =
+                ssd->cxl_req && femu_ring_count(ssd->cxl_req);
+            bool prefetch_pending =
+                ssd->cxl_prefetch_req &&
+                femu_ring_count(ssd->cxl_prefetch_req);
+
+            /*
+             * Schedule at most one cheap hint classification before serving
+             * demand.  Separate rings reserve demand capacity; weighted
+             * service also prevents a continuous demand stream from starving
+             * every software-prefetch request.
+             */
+            if (prefetch_pending && (prefer_prefetch || !demand_pending)) {
+                cxl_ring = ssd->cxl_prefetch_req;
+                prefer_prefetch = false;
+            } else if (demand_pending) {
+                cxl_ring = ssd->cxl_req;
+                prefer_prefetch = true;
+            }
+
+            if (cxl_ring) {
                 struct cxl_req *creq = NULL;
                 struct ppa ppa;
                 struct buffer_entry *bentry;
+                CylonCxlFill *fill;
                 lpn_t lpn;
+                bool read;
+                bool prefetch;
+                bool created;
                 
-                rc = femu_ring_dequeue(ssd->cxl_req, (void *)&creq, 1);
+                rc = femu_ring_dequeue(cxl_ring, (void *)&creq, 1);
                 if (rc != 1) {
                     ftl_err("CXL request dequeue failed\n");
                     abort();
@@ -1190,20 +1374,31 @@ static void *ftl_thread(void *arg)
                     abort();
                 }
 #ifdef LSA_TROLL
+                if (creq->ncmd.cmd >= BUF_PRINT_STAT) {
+                    /* Control requests are barriers for earlier fills. */
+                    drain_cxl_fills(n, buffer, &fills);
+                }
                 switch (creq->ncmd.cmd) {
                 case BUF_PRINT_STAT:
+                    cylon_cxl_fill_reset_peak(&fills);
                     skip = true;
                     break;
                 case BUF_CLEAR:
                     buffer_clear(buffer);
+                    cylon_cxl_fill_reset_peak(&fills);
                     skip = true;
                     break;
                 case SSD_INIT:
                     skip = true;
                     break;
                 case INC_PREFETCH_DEGREE:
-                    n->prefetch_degree = (n->prefetch_degree+1)%4;
-                    buffer->degree = n->prefetch_degree;
+                    if (n->cxl_async_sw_prefetch) {
+                        n->prefetch_degree = 0;
+                        buffer->degree = 0;
+                    } else {
+                        n->prefetch_degree = (n->prefetch_degree + 1) % 4;
+                        buffer->degree = n->prefetch_degree;
+                    }
                     // ssd_init_buffer(n);
                     skip = true;
                     break;
@@ -1225,60 +1420,146 @@ static void *ftl_thread(void *arg)
 #endif
                 lpn = creq->lpn;
                 lat = 0;
-                read = (creq->ncmd.cmd == CXL_READ);
+                prefetch = (creq->ncmd.cmd == CXL_PREFETCH);
+                read = prefetch || (creq->ncmd.cmd == CXL_READ);
+                if (prefetch) {
+                    qatomic_inc(&buffer->cxl_sw_prefetch_processed);
+                }
                 // printf("[CXL]: lpn(0x%lx) %s\n", lpn, read?"READ":"WRITE");
+
+                if (!valid_lpn(ssd, lpn)) {
+                    if (prefetch) {
+                        qatomic_inc(&buffer->cxl_sw_prefetch_dropped);
+                        qatomic_inc(&buffer->cxl_sw_prefetch_invalid_drops);
+                        release_cxl_prefetch_token(n);
+                        complete_cxl_req(creq);
+                        continue;
+                    }
+                    ftl_err("invalid demand CXL LPN: %" PRIu64 "\n", lpn);
+                    abort();
+                }
 
                 bentry = buffer_lookup_entry(buffer, lpn);
                 if (bentry) {//buffer hit
-                    bentry->dirty = (bentry->dirty==false && read)?false:true;
-
-                    if (read)   buffer->read_hit++;
-                    else        buffer->write_hit++;
-                    buffer_insert_entry(buffer, bentry, INSERT_NO_PREFETCH);
-                    complete_cxl_req(creq);
-                }
-                else {//buffer miss: fetch from NAND
-                    bentry = buffer_entry_init(buffer, lpn);
-                    bentry->dirty = (read)?false:true;
-
-                    if (read)   buffer->read_miss++;
-                    else        buffer->write_miss++;
-                    
-                    ppa = get_maptbl_ent(ssd, lpn);
-                    if (mapped_ppa(&ppa) && valid_ppa(ssd, &ppa)) {
-                        creq->ncmd.cmd = NAND_READ;
-                        lat += ssd_advance_status(ssd, &ppa, &creq->ncmd);
-                        qatomic_inc(&buffer->cxl_mapped_nand_reads);
-                        // backend_memcpy(ssd, ppa, bentry->idx, NAND_TO_BUF);
-                    }
-                    else {
-                        struct ppa new_ppa;
-                        // printf("%s,lpn(%" PRId64 ") not mapped to valid ppa\n", ssd->ssdname, lpn);
-                        // printf("Invalid ppa,ch:%d,lun:%d,blk:%d,pl:%d,pg:%d,sec:%d\n",
-                        // ppa.g.ch, ppa.g.lun, ppa.g.blk, ppa.g.pl, ppa.g.pg, ppa.g.sec);
-                        ftl_assert(valid_lpn(ssd, lpn));
-                        new_ppa = get_new_page(ssd);
-                        /* update maptbl */
-                        set_maptbl_ent(ssd, lpn, &new_ppa);
-                        /* update rmap */
-                        set_rmap_ent(ssd, lpn, &new_ppa);
-
-                        mark_page_valid(ssd, &new_ppa);
-                        ssd_advance_write_pointer(ssd);
-
-                        creq->ncmd.cmd = NAND_WRITE;
-                        lat += ssd_advance_status(ssd, &new_ppa, &creq->ncmd);
+                    if (prefetch) {
+                        qatomic_inc(&buffer->cxl_sw_prefetch_hits);
+                        release_cxl_prefetch_token(n);
+                    } else {
+                        bentry->dirty = bentry->dirty || !read;
                         if (read) {
-                            qatomic_inc(
-                                &buffer->cxl_unmapped_read_alloc_writes);
+                            buffer->read_hit++;
+                        } else {
+                            buffer->write_hit++;
                         }
-                        
+                        buffer_insert_entry(buffer, bentry,
+                                            INSERT_NO_PREFETCH);
                     }
-                    qatomic_add(&buffer->cxl_modeled_nand_wait_ns, lat);
-                    creq->expire_time += lat;
-                    buffer_insert_entry(buffer, bentry, INSERT_PREFETCH);
                     complete_cxl_req(creq);
+                    continue;
                 }
+
+                fill = cylon_cxl_fill_lookup(&fills, lpn);
+                if (fill) {
+                    if (prefetch) {
+                        qatomic_inc(&buffer->cxl_sw_prefetch_deduplicated);
+                        release_cxl_prefetch_token(n);
+                        complete_cxl_req(creq);
+                    } else {
+                        if (read) {
+                            buffer->read_miss++;
+                        } else {
+                            buffer->write_miss++;
+                            fill->dirty = true;
+                        }
+                        qatomic_inc(&buffer->cxl_demand_inflight_joins);
+                        if (fill->prefetch_origin) {
+                            if (!fill->demand_joined) {
+                                qatomic_inc(
+                                    &buffer->cxl_demand_joined_prefetch_fill);
+                            }
+                            fill->demand_joined = true;
+                        } else {
+                            qatomic_inc(
+                                &buffer->cxl_demand_joined_demand_fill);
+                        }
+                        cylon_cxl_fill_add_waiter(fill, creq);
+                    }
+                    continue;
+                }
+
+                if (prefetch &&
+                    fills.prefetch_count >= n->cxl_async_max_inflight) {
+                    qatomic_inc(&buffer->cxl_sw_prefetch_dropped);
+                    qatomic_inc(
+                        &buffer->cxl_sw_prefetch_inflight_cap_drops);
+                    release_cxl_prefetch_token(n);
+                    complete_cxl_req(creq);
+                    continue;
+                }
+
+                ppa = get_maptbl_ent(ssd, lpn);
+                if (prefetch &&
+                    (!mapped_ppa(&ppa) || !valid_ppa(ssd, &ppa))) {
+                    /* A hint must not allocate or mutate the FTL mapping. */
+                    qatomic_inc(&buffer->cxl_sw_prefetch_dropped);
+                    qatomic_inc(&buffer->cxl_sw_prefetch_unmapped_drops);
+                    release_cxl_prefetch_token(n);
+                    complete_cxl_req(creq);
+                    continue;
+                }
+
+                if (!prefetch) {
+                    if (read) {
+                        buffer->read_miss++;
+                    } else {
+                        buffer->write_miss++;
+                    }
+                }
+
+                if (mapped_ppa(&ppa) && valid_ppa(ssd, &ppa)) {
+                    creq->ncmd.cmd = NAND_READ;
+                    lat = ssd_advance_status(ssd, &ppa, &creq->ncmd);
+                    qatomic_inc(&buffer->cxl_mapped_nand_reads);
+                    if (prefetch) {
+                        qatomic_inc(&buffer->cxl_sw_prefetch_nand_reads);
+                    }
+                } else {
+                    struct ppa new_ppa = get_new_page(ssd);
+
+                    set_maptbl_ent(ssd, lpn, &new_ppa);
+                    set_rmap_ent(ssd, lpn, &new_ppa);
+                    mark_page_valid(ssd, &new_ppa);
+                    ssd_advance_write_pointer(ssd);
+
+                    creq->ncmd.cmd = NAND_WRITE;
+                    lat = ssd_advance_status(ssd, &new_ppa, &creq->ncmd);
+                    if (read) {
+                        qatomic_inc(&buffer->cxl_unmapped_read_alloc_writes);
+                    }
+                }
+
+                qatomic_add(&buffer->cxl_modeled_nand_wait_ns, lat);
+                creq->expire_time += lat;
+                fill = cylon_cxl_fill_get_or_create(&fills, lpn,
+                                                     creq->expire_time,
+                                                     prefetch, NULL,
+                                                     &created);
+                if (!created) {
+                    ftl_err("duplicate fill creation for lpn=%" PRIu64 "\n",
+                            lpn);
+                    abort();
+                }
+                fill->dirty = !read;
+                fill->holds_prefetch_token = prefetch;
+                update_cxl_inflight_peak(buffer, &fills);
+
+                if (prefetch) {
+                    /* The hint retires now; the independent fill remains. */
+                    complete_cxl_req(creq);
+                } else {
+                    cylon_cxl_fill_add_waiter(fill, creq);
+                }
+
                 /* clean one line if needed (in the background) */
                 if (should_gc(ssd)) {
                     do_gc(ssd, false);
@@ -1329,6 +1610,7 @@ static void *ftl_thread(void *arg)
         }
     }
 
+    cylon_cxl_fill_tracker_destroy(&fills);
     return NULL;
 }
 

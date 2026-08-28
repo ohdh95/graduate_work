@@ -215,6 +215,7 @@ struct nand_cmd {
 enum {
     CXL_READ,
     CXL_WRITE,
+    CXL_PREFETCH,
     BUF_PRINT_STAT,
     BUF_CLEAR,
     SSD_INIT,
@@ -251,11 +252,13 @@ struct ssd {
     struct rte_ring **to_poller;
 
     struct rte_ring *cxl_req;
+    struct rte_ring *cxl_prefetch_req;
 
     struct buffer dram_buffer;
 
     bool *dataplane_started_ptr;
     QemuThread ftl_thread;
+    bool ftl_should_stop;
 };
 
 void cylon_cxl_req_put(struct cxl_req *creq);

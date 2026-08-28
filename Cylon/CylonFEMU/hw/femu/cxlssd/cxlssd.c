@@ -6,6 +6,13 @@
 FILE *mem_acc_log_file;
 static uint64_t cxl_request_sequence;
 
+typedef enum CxlEnqueueResult {
+    CXL_ENQUEUE_OK,
+    CXL_ENQUEUE_CLOSED,
+    CXL_ENQUEUE_FULL,
+    CXL_ENQUEUE_LIMIT,
+} CxlEnqueueResult;
+
 static struct cxl_req *cxl_request_new(int command, lpn_t lpn,
                                        uint64_t start_time,
                                        bool map_digest_requested)
@@ -28,8 +35,13 @@ static struct cxl_req *cxl_request_new(int command, lpn_t lpn,
     return request;
 }
 
-static void cxl_request_enqueue(FemuCtrl *n, struct cxl_req *request)
+static CxlEnqueueResult cxl_request_try_enqueue(FemuCtrl *n,
+                                                struct rte_ring *ring,
+                                                struct cxl_req *request)
 {
+    bool accepting;
+    bool limited = false;
+    bool token_reserved = false;
     int rc;
 
     if (!cylon_cxl_request_mark_enqueued(&request->lifetime)) {
@@ -39,17 +51,47 @@ static void cxl_request_enqueue(FemuCtrl *n, struct cxl_req *request)
         abort();
     }
 
-    rc = femu_ring_enqueue(n->cxl_req, (void *)&request, 1);
+    /*
+     * Serialize the shutdown gate with publication.  Once exit closes this
+     * gate, no producer can publish behind the FTL thread's final drain.
+     */
+    qemu_mutex_lock(&n->cxl_req_gate);
+    accepting = n->cxl_accept_requests &&
+        (request->ncmd.cmd != CXL_PREFETCH || n->cxl_accept_prefetch);
+    if (accepting && request->ncmd.cmd == CXL_PREFETCH &&
+        qatomic_read(&n->cxl_prefetch_outstanding) >=
+            n->cxl_async_max_inflight) {
+        limited = true;
+        rc = 0;
+    } else {
+        if (accepting && request->ncmd.cmd == CXL_PREFETCH) {
+            /* Reserve before publication; the FTL may dequeue immediately. */
+            qatomic_inc(&n->cxl_prefetch_outstanding);
+            token_reserved = true;
+        }
+        rc = accepting ? femu_ring_enqueue(ring, (void *)&request, 1) : 0;
+    }
+    if (rc != 1 && token_reserved) {
+        qatomic_dec(&n->cxl_prefetch_outstanding);
+    }
+    qemu_mutex_unlock(&n->cxl_req_gate);
+
     if (rc != 1) {
-        femu_err("CXL request enqueue failed: seq=%" PRIu64 " ret=%d\n",
-                 request->lifetime.sequence, rc);
+        if (accepting && request->ncmd.cmd != CXL_PREFETCH) {
+            femu_err("CXL request enqueue failed: seq=%" PRIu64
+                     " ret=%d\n", request->lifetime.sequence, rc);
+        }
         if (!cylon_cxl_request_cancel_unpublished(&request->lifetime)) {
             femu_err("CXL request cancellation state differs\n");
             abort();
         }
         g_free(request);
-        abort();
+        if (!accepting) {
+            return CXL_ENQUEUE_CLOSED;
+        }
+        return limited ? CXL_ENQUEUE_LIMIT : CXL_ENQUEUE_FULL;
     }
+    return CXL_ENQUEUE_OK;
 }
 
 static void cxlssd_init_ctrl_str(FemuCtrl *n)
@@ -65,6 +107,30 @@ static void cxlssd_init_ctrl_str(FemuCtrl *n)
 /* cxlssd <= [bb <=> black-box] */
 static void cxlssd_init(FemuCtrl *n, Error **errp)
 {
+    n->cxlssd_initialized = false;
+    if (n->cxl_async_sw_prefetch && n->prefetch_degree) {
+        error_setg(errp,
+                   "cxl_async_sw_prefetch requires prefetch_degree=0; "
+                   "legacy Next-N does not model asynchronous NAND timing");
+        return;
+    }
+    if (n->cxl_async_sw_prefetch &&
+        (!n->cxl_async_max_inflight ||
+         n->cxl_async_max_inflight > FEMU_MAX_INF_REQS)) {
+        error_setg(errp,
+                   "cxl_async_sw_prefetch requires "
+                   "1 <= cxl_async_max_inflight <= %u",
+                   FEMU_MAX_INF_REQS);
+        return;
+    }
+    if (n->cxl_async_sw_prefetch &&
+        femu_kvm_cylon_prefetch_abi_version() != 1) {
+        error_setg(errp,
+                   "host KVM lacks Cylon async-prefetch ABI version 1; "
+                   "boot the matching CylonLinux kernel");
+        return;
+    }
+
     femu_kvm_log_init();
 
     struct ssd *ssd = n->ssd = g_malloc0(sizeof(struct ssd));
@@ -77,14 +143,26 @@ static void cxlssd_init(FemuCtrl *n, Error **errp)
     femu_debug("Starting FEMU in CXL-SSD mode ...\n");
     
     /* init queue */
+    qemu_mutex_init(&n->cxl_req_gate);
+    qemu_mutex_init(&n->cxl_control_gate);
+    n->cxl_accept_requests = true;
+    n->cxl_accept_prefetch = true;
+    qatomic_set(&n->cxl_prefetch_outstanding, 0);
     n->cxl_req = femu_ring_create(FEMU_RING_TYPE_MP_SC, FEMU_MAX_INF_REQS);
     if (!n->cxl_req) {
         femu_err("Failed to create ring (n->cxl_req) ...\n");
         abort();
     }
+    n->cxl_prefetch_req =
+        femu_ring_create(FEMU_RING_TYPE_MP_SC, FEMU_MAX_INF_REQS);
+    if (!n->cxl_prefetch_req) {
+        femu_err("Failed to create ring (n->cxl_prefetch_req) ...\n");
+        abort();
+    }
     
     femu_kvm_set_user_memory_region(n);
     ssd_init(n);
+    n->cxlssd_initialized = true;
 
     mem_acc_log_file = fopen("/home/necsst/cxlssd_log.txt", "w+");
 
@@ -94,11 +172,26 @@ static void cxlssd_init(FemuCtrl *n, Error **errp)
 
 static void cxlssd_exit(FemuCtrl *n)
 {
+    if (!n->cxlssd_initialized) {
+        return;
+    }
 
-    femu_ring_free(n->cxl_req);
-
-    femu_kvm_del_user_memory_region(n);
+    /* Stop publication, then drain the FTL before freeing rings or memslot. */
+    qemu_mutex_lock(&n->cxl_control_gate);
+    qemu_mutex_lock(&n->cxl_req_gate);
+    n->cxl_accept_requests = false;
+    n->cxl_accept_prefetch = false;
+    qemu_mutex_unlock(&n->cxl_req_gate);
+    /* No poller may publish a new NVMe request while the FTL drains. */
+    nvme_quiesce_pollers(n);
     ssd_reset(n);
+    femu_kvm_del_user_memory_region(n);
+    femu_ring_free(n->cxl_prefetch_req);
+    femu_ring_free(n->cxl_req);
+    n->cxlssd_initialized = false;
+    qemu_mutex_destroy(&n->cxl_req_gate);
+    qemu_mutex_unlock(&n->cxl_control_gate);
+    qemu_mutex_destroy(&n->cxl_control_gate);
 }
 
 static void cxlssd_flip(FemuCtrl *n, NvmeCmd *cmd)
@@ -185,7 +278,10 @@ static void wait_for_buf_update(FemuCtrl *n, uint64_t addr, int c)
     struct cxl_req *myreq = cxl_request_new(c, lpn, now, false);
 
     /* Send the request to the single FTL consumer. */
-    cxl_request_enqueue(n, myreq);
+    if (cxl_request_try_enqueue(n, n->cxl_req, myreq) != CXL_ENQUEUE_OK) {
+        femu_err("demand CXL request queue is full\n");
+        abort();
+    }
 
     /*
      * Each producer waits only for its own request.  qemu_event_set/wait
@@ -208,15 +304,37 @@ static void wait_for_buf_update(FemuCtrl *n, uint64_t addr, int c)
                  cylon_cxl_request_state(&myreq->lifetime));
         abort();
     }
-    const uint64_t expire_time = myreq->expire_time;
-    do {
-        now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
-    } while (now < expire_time);
     if (had_bql) {
         qemu_mutex_lock_iothread();
     }
 
     cylon_cxl_req_put(myreq);
+}
+
+static void enqueue_async_prefetch(FemuCtrl *n, uint64_t addr)
+{
+    struct buffer *buffer = &n->ssd->dram_buffer;
+    uint64_t now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+    struct cxl_req *request = cxl_request_new(CXL_PREFETCH, addr >> 12,
+                                              now, false);
+    CxlEnqueueResult result;
+
+    result = cxl_request_try_enqueue(n, n->cxl_prefetch_req, request);
+    if (result != CXL_ENQUEUE_OK) {
+        qatomic_inc(&buffer->cxl_sw_prefetch_dropped);
+        if (result == CXL_ENQUEUE_FULL) {
+            qatomic_inc(&buffer->cxl_sw_prefetch_queue_full_drops);
+        } else if (result == CXL_ENQUEUE_LIMIT) {
+            qatomic_inc(&buffer->cxl_sw_prefetch_outstanding_limit_drops);
+        } else {
+            qatomic_inc(&buffer->cxl_sw_prefetch_admission_drops);
+        }
+        return;
+    }
+
+    qatomic_inc(&buffer->cxl_sw_prefetch_enqueued);
+    /* Fire-and-forget: the FTL owns the remaining lifetime reference. */
+    cylon_cxl_req_put(request);
 }
 
 // #include <execinfo.h>
@@ -242,6 +360,20 @@ static MemTxResult cxlssd_mem_read(void *opaque, uint64_t addr, uint64_t *data, 
 
     FemuCtrl *n = (FemuCtrl*)opaque;
     struct buffer *buffer = &n->ssd->dram_buffer;
+
+    if (attrs.cylon_prefetch) {
+        qatomic_inc(&buffer->cxl_sw_prefetch_callbacks);
+        *data = 0;
+        if (!n->cxl_async_sw_prefetch || n->cxl_skip_ftl ||
+            addr >= n->mbe->size) {
+            qatomic_inc(&buffer->cxl_sw_prefetch_dropped);
+            qatomic_inc(&buffer->cxl_sw_prefetch_admission_drops);
+            return MEMTX_OK;
+        }
+        enqueue_async_prefetch(n, addr);
+        return MEMTX_OK;
+    }
+
     assert(addr < n->mbe->size);
     qatomic_inc(&buffer->cxl_mmio_read_callbacks);
     // qemu_mutex_lock(&n->mutex);
@@ -261,7 +393,6 @@ static MemTxResult cxlssd_mem_read(void *opaque, uint64_t addr, uint64_t *data, 
     // void *backend_addr = n->mbe->buf_space + addr;
     // lpn_t lpn = addr >> 12;
 
-    memcpy(data, backend_addr, size);
     // uint64_t result = 0;
     // for (unsigned i = 0; i < size; ++i) {
     //     result |= ((uint64_t)((uint8_t *)backend_addr)[i]) << (i * 8);
@@ -284,6 +415,8 @@ static MemTxResult cxlssd_mem_read(void *opaque, uint64_t addr, uint64_t *data, 
     } else {
         qatomic_inc(&buffer->cxl_skip_ftl_bypasses);
     }
+    /* Observe the backing data only after a miss fill has become resident. */
+    memcpy(data, backend_addr, size);
     // qemu_mutex_unlock(&n->mutex);
     return MEMTX_OK;
 }
@@ -348,13 +481,44 @@ static MemTxResult cxlssd_mem_write(void *opaque, uint64_t addr, uint64_t data, 
 }
 
 #ifdef LSA_TROLL
-static void req_ftl(FemuCtrl *n, int c, CylonFtlMapDigest *map_digest)
+static void cxl_prefetch_barrier_begin(FemuCtrl *n)
+{
+    qemu_mutex_lock(&n->cxl_control_gate);
+    qemu_mutex_lock(&n->cxl_req_gate);
+    n->cxl_accept_prefetch = false;
+    qemu_mutex_unlock(&n->cxl_req_gate);
+
+    /*
+     * Publication is serialized by cxl_req_gate.  Once admission is closed,
+     * a zero ring count means every earlier hint has been dequeued by the
+     * single FTL consumer.  That consumer finishes classifying the dequeued
+     * request before it can observe the control request published next.
+     */
+    while (femu_ring_count(n->cxl_prefetch_req)) {
+        g_usleep(50);
+    }
+}
+
+static void cxl_prefetch_barrier_end(FemuCtrl *n)
+{
+    qemu_mutex_lock(&n->cxl_req_gate);
+    if (n->cxl_accept_requests) {
+        n->cxl_accept_prefetch = true;
+    }
+    qemu_mutex_unlock(&n->cxl_req_gate);
+    qemu_mutex_unlock(&n->cxl_control_gate);
+}
+
+static void req_ftl_quiesced(FemuCtrl *n, int c,
+                             CylonFtlMapDigest *map_digest)
 {   
     struct cxl_req *myreq = cxl_request_new(c, 0, 0,
                                             map_digest != NULL);
 
-    /* Send the control request and wait for the FTL-side barrier. */
-    cxl_request_enqueue(n, myreq);
+    if (cxl_request_try_enqueue(n, n->cxl_req, myreq) != CXL_ENQUEUE_OK) {
+        femu_err("CXL control request queue is full\n");
+        abort();
+    }
     if (!cylon_cxl_request_wait(&myreq->lifetime)) {
         femu_err("CXL control wait state differs: seq=%" PRIu64
                  " state=%u\n", myreq->lifetime.sequence,
@@ -366,6 +530,14 @@ static void req_ftl(FemuCtrl *n, int c, CylonFtlMapDigest *map_digest)
         *map_digest = myreq->map_digest;
     }
     cylon_cxl_req_put(myreq);
+}
+
+static void req_ftl(FemuCtrl *n, int c, CylonFtlMapDigest *map_digest)
+{
+    /* Stop later hints, dequeue earlier hints, then drain their fills in FTL. */
+    cxl_prefetch_barrier_begin(n);
+    req_ftl_quiesced(n, c, map_digest);
+    cxl_prefetch_barrier_end(n);
 }
 #endif
 
@@ -418,9 +590,31 @@ static uint16_t get_lsa(struct FemuCtrl *n, void *buf, uint64_t size, uint64_t o
         uint64_t mapped_nand_reads;
         uint64_t unmapped_read_alloc_writes;
         uint64_t modeled_nand_wait_ns;
+        uint64_t sw_prefetch_callbacks;
+        uint64_t sw_prefetch_enqueued;
+        uint64_t sw_prefetch_processed;
+        uint64_t sw_prefetch_dropped;
+        uint64_t sw_prefetch_admission_drops;
+        uint64_t sw_prefetch_queue_full_drops;
+        uint64_t sw_prefetch_outstanding_limit_drops;
+        uint64_t sw_prefetch_invalid_drops;
+        uint64_t sw_prefetch_unmapped_drops;
+        uint64_t sw_prefetch_inflight_cap_drops;
+        uint64_t sw_prefetch_hits;
+        uint64_t sw_prefetch_deduplicated;
+        uint64_t sw_prefetch_nand_reads;
+        uint64_t demand_inflight_joins;
+        uint64_t demand_joined_prefetch_fill;
+        uint64_t demand_joined_demand_fill;
+        uint64_t prefetch_unjoined_completions;
+        uint64_t async_fill_completions;
+        uint64_t async_inflight_peak;
+        uint64_t prefetch_ring_pending;
+        uint64_t prefetch_outstanding;
 
-        req_ftl(n, BUF_PRINT_STAT, NULL);
-        req_ftl(n, FTL_MAP_DIGEST, &map_digest);
+        cxl_prefetch_barrier_begin(n);
+        req_ftl_quiesced(n, BUF_PRINT_STAT, NULL);
+        req_ftl_quiesced(n, FTL_MAP_DIGEST, &map_digest);
         mmio_read_callbacks =
             qatomic_xchg(&buffer->cxl_mmio_read_callbacks, 0);
         skip_ftl_bypasses =
@@ -431,6 +625,47 @@ static uint16_t get_lsa(struct FemuCtrl *n, void *buf, uint64_t size, uint64_t o
             qatomic_xchg(&buffer->cxl_unmapped_read_alloc_writes, 0);
         modeled_nand_wait_ns =
             qatomic_xchg(&buffer->cxl_modeled_nand_wait_ns, 0);
+        sw_prefetch_callbacks =
+            qatomic_xchg(&buffer->cxl_sw_prefetch_callbacks, 0);
+        sw_prefetch_enqueued =
+            qatomic_xchg(&buffer->cxl_sw_prefetch_enqueued, 0);
+        sw_prefetch_processed =
+            qatomic_xchg(&buffer->cxl_sw_prefetch_processed, 0);
+        sw_prefetch_dropped =
+            qatomic_xchg(&buffer->cxl_sw_prefetch_dropped, 0);
+        sw_prefetch_admission_drops =
+            qatomic_xchg(&buffer->cxl_sw_prefetch_admission_drops, 0);
+        sw_prefetch_queue_full_drops =
+            qatomic_xchg(&buffer->cxl_sw_prefetch_queue_full_drops, 0);
+        sw_prefetch_outstanding_limit_drops = qatomic_xchg(
+            &buffer->cxl_sw_prefetch_outstanding_limit_drops, 0);
+        sw_prefetch_invalid_drops =
+            qatomic_xchg(&buffer->cxl_sw_prefetch_invalid_drops, 0);
+        sw_prefetch_unmapped_drops =
+            qatomic_xchg(&buffer->cxl_sw_prefetch_unmapped_drops, 0);
+        sw_prefetch_inflight_cap_drops = qatomic_xchg(
+            &buffer->cxl_sw_prefetch_inflight_cap_drops, 0);
+        sw_prefetch_hits =
+            qatomic_xchg(&buffer->cxl_sw_prefetch_hits, 0);
+        sw_prefetch_deduplicated =
+            qatomic_xchg(&buffer->cxl_sw_prefetch_deduplicated, 0);
+        sw_prefetch_nand_reads =
+            qatomic_xchg(&buffer->cxl_sw_prefetch_nand_reads, 0);
+        demand_inflight_joins =
+            qatomic_xchg(&buffer->cxl_demand_inflight_joins, 0);
+        demand_joined_prefetch_fill = qatomic_xchg(
+            &buffer->cxl_demand_joined_prefetch_fill, 0);
+        demand_joined_demand_fill = qatomic_xchg(
+            &buffer->cxl_demand_joined_demand_fill, 0);
+        prefetch_unjoined_completions = qatomic_xchg(
+            &buffer->cxl_prefetch_unjoined_completions, 0);
+        async_fill_completions =
+            qatomic_xchg(&buffer->cxl_async_fill_completions, 0);
+        async_inflight_peak =
+            qatomic_xchg(&buffer->cxl_async_inflight_peak, 0);
+        prefetch_ring_pending = femu_ring_count(n->cxl_prefetch_req);
+        prefetch_outstanding =
+            qatomic_read(&n->cxl_prefetch_outstanding);
         print_buffer_policy(f, n, buffer, offset);
         fprintf(f,"Entry cnt: %" PRIu64 "/%" PRIu64 "\n",
                 buffer->entry_cnt, buffer->size);
@@ -455,6 +690,37 @@ static uint16_t get_lsa(struct FemuCtrl *n, void *buf, uint64_t size, uint64_t o
                 mmio_read_callbacks, skip_ftl_bypasses,
                 mapped_nand_reads, unmapped_read_alloc_writes,
                 modeled_nand_wait_ns);
+        fprintf(f,
+                "CXL async prefetch: callbacks=%" PRIu64
+                " enqueued=%" PRIu64 " processed=%" PRIu64
+                " dropped=%" PRIu64
+                " resident_hits=%" PRIu64 " deduplicated=%" PRIu64
+                " nand_reads=%" PRIu64 " demand_joins=%" PRIu64
+                " completions=%" PRIu64 " inflight_peak=%" PRIu64
+                " ring_pending=%" PRIu64
+                " outstanding=%" PRIu64 "\n",
+                sw_prefetch_callbacks, sw_prefetch_enqueued,
+                sw_prefetch_processed, sw_prefetch_dropped, sw_prefetch_hits,
+                sw_prefetch_deduplicated, sw_prefetch_nand_reads,
+                demand_inflight_joins, async_fill_completions,
+                async_inflight_peak, prefetch_ring_pending,
+                prefetch_outstanding);
+        fprintf(f,
+                "CXL async detail: admission_drops=%" PRIu64
+                " queue_full_drops=%" PRIu64
+                " outstanding_limit_drops=%" PRIu64
+                " invalid_drops=%" PRIu64
+                " unmapped_drops=%" PRIu64
+                " inflight_cap_drops=%" PRIu64
+                " joined_prefetch_fill=%" PRIu64
+                " joined_demand_fill=%" PRIu64
+                " prefetch_unjoined_completions=%" PRIu64 "\n",
+                sw_prefetch_admission_drops, sw_prefetch_queue_full_drops,
+                sw_prefetch_outstanding_limit_drops,
+                sw_prefetch_invalid_drops, sw_prefetch_unmapped_drops,
+                sw_prefetch_inflight_cap_drops,
+                demand_joined_prefetch_fill, demand_joined_demand_fill,
+                prefetch_unjoined_completions);
         /* Append after the legacy seven-line stats block. */
         fprintf(f,
                 "FTL mapping digest: schema=%s sha256=%s"
@@ -467,6 +733,7 @@ static uint16_t get_lsa(struct FemuCtrl *n, void *buf, uint64_t size, uint64_t o
         buffer->ins_cnt = buffer->evict_cnt = buffer->read_hit = buffer->read_miss = buffer->write_hit = buffer->write_miss = 0;
         buffer->victim_trace_count = 0;
         buffer->victim_trace_dropped = 0;
+        cxl_prefetch_barrier_end(n);
 
         break;
     }
@@ -487,7 +754,8 @@ static uint16_t get_lsa(struct FemuCtrl *n, void *buf, uint64_t size, uint64_t o
          * workload is running.  Drain earlier FTL requests before replacing
          * the set array.
          */
-        req_ftl(n, BUF_PRINT_STAT, NULL);
+        cxl_prefetch_barrier_begin(n);
+        req_ftl_quiesced(n, BUF_PRINT_STAT, NULL);
         buffer_clear(buffer);
         buffer_destroy_set(buffer);
 
@@ -499,11 +767,19 @@ static uint16_t get_lsa(struct FemuCtrl *n, void *buf, uint64_t size, uint64_t o
                 buffer->policy < POLICY_MAX ?
                     policy_str[buffer->policy] : "INVALID",
                 buffer->degree, way);
+        cxl_prefetch_barrier_end(n);
 
         break;
     }
     case 5: //set prefetch degree
+        if (n->cxl_async_sw_prefetch && offset != 0) {
+            fprintf(f,
+                    "[Set degree rejected] async SW prefetch requires "
+                    "legacy Next-N degree 0\n");
+            break;
+        }
         buffer->degree = offset;
+        n->prefetch_degree = offset;
         fprintf(f,"[Set degree] \n\t");
         print_buffer_policy(f, n, buffer, offset);
         break;

@@ -572,14 +572,26 @@ static void femu_realize(PCIDevice *pci_dev, Error **errp)
     }
 }
 
+void nvme_quiesce_pollers(FemuCtrl *n)
+{
+    int i;
+
+    if (n->pollers_joined) {
+        return;
+    }
+    qatomic_set(&n->poller_on, false);
+    for (i = 1; i <= n->nr_pollers; i++) {
+        qemu_thread_join(&n->poller[i]);
+    }
+    n->pollers_joined = true;
+}
+
 static void nvme_destroy_poller(FemuCtrl *n)
 {
     int i;
     femu_debug("Destroying NVMe poller !!\n");
 
-    for (i = 1; i <= n->nr_pollers; i++) {
-        qemu_thread_join(&n->poller[i]);
-    }
+    nvme_quiesce_pollers(n);
 
     for (i = 1; i <= n->nr_pollers; i++) {
         pqueue_free(n->pq[i]);
@@ -625,6 +637,10 @@ static Property femu_props[] = {
     DEFINE_PROP_UINT8("prefetch_degree", FemuCtrl, prefetch_degree, 0),
     DEFINE_PROP_UINT8("buffer_way", FemuCtrl, buffer_way, 0),
     DEFINE_PROP_UINT8("cxl_skip_ftl", FemuCtrl, cxl_skip_ftl, 0),
+    DEFINE_PROP_UINT8("cxl_async_sw_prefetch", FemuCtrl,
+                      cxl_async_sw_prefetch, 0),
+    DEFINE_PROP_UINT32("cxl_async_max_inflight", FemuCtrl,
+                       cxl_async_max_inflight, 4096),
     // DEFINE_PROP_UINT64("base_gpa", FemuCtrl, base_gpa, 0),
     DEFINE_PROP_UINT32("namespaces", FemuCtrl, num_namespaces, 1),
     DEFINE_PROP_UINT32("queues", FemuCtrl, nr_io_queues, 8),

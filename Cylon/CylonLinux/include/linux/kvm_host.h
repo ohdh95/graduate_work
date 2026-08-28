@@ -59,6 +59,7 @@
 
 /* Memslot support both direct and mmio accesses. */
 #define KVM_MEMSLOT_DUAL_MODE	(1UL << 17)
+#define KVM_MEMSLOT_CYLON_PREFETCH	KVM_MEM_CYLON_PREFETCH
 /*
  * Bit 63 of the memslot generation number is an "update in-progress flag",
  * e.g. is temporarily set for the duration of kvm_swap_active_memslots().

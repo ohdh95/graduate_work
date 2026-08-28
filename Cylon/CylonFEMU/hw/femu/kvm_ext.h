@@ -7,6 +7,7 @@
 #include "sysemu/kvm.h"
 
 #define KVM_MEMSLOT_DUAL_MODE	(1UL << 17)
+#define KVM_MEMSLOT_CYLON_PREFETCH	KVM_MEM_CYLON_PREFETCH
 #define PAGE_SHIFT 12
 #define MAX_ORDER 10
 #define MAX_CONT_ALLOC_SZ (1<< (MAX_ORDER + PAGE_SHIFT))
@@ -42,6 +43,8 @@ int femu_kvm_spte_clear_mmio_flag(uint64_t gfn, uint64_t uaddr);
 
 int femu_kvm_set_user_memory_region(FemuCtrl *n);
 int femu_kvm_del_user_memory_region(FemuCtrl *n);
+int femu_kvm_cylon_prefetch_abi_version(void);
+MemTxResult femu_kvm_dispatch_cylon_prefetch(uint64_t gpa, uint8_t hint);
 
 int femu_kvm_set_spte_by_cxl_mmio_rate(FemuCtrl *n, int r_cxl);
 int femu_kvm_reset_spte_by_cxl_mmio_rate(FemuCtrl *n, int r_cxl);

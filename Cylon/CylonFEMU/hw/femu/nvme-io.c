@@ -225,7 +225,7 @@ void *nvme_poller(void *arg)
 
     switch (n->multipoller_enabled) {
     case 1:
-        while (1) {
+        while (qatomic_read(&n->poller_on)) {
             if ((!n->dataplane_started)) {
                 usleep(1000);
                 continue;
@@ -240,7 +240,7 @@ void *nvme_poller(void *arg)
         }
         break;
     default:
-        while (1) {
+        while (qatomic_read(&n->poller_on)) {
             if ((!n->dataplane_started)) {
                 usleep(1000);
                 continue;

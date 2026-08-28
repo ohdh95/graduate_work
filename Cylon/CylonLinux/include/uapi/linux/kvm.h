@@ -102,6 +102,8 @@ struct kvm_userspace_memory_region {
  */
 #define KVM_MEM_LOG_DIRTY_PAGES	(1UL << 0)
 #define KVM_MEM_READONLY	(1UL << 1)
+/* Cylon private ABI: enable response-free PREFETCH exits for this memslot. */
+#define KVM_MEM_CYLON_PREFETCH	(1UL << 18)
 
 /* for KVM_IRQ_LINE */
 struct kvm_irq_level {
@@ -264,6 +266,13 @@ struct kvm_xen_exit {
 #define KVM_EXIT_RISCV_SBI        35
 #define KVM_EXIT_RISCV_CSR        36
 #define KVM_EXIT_NOTIFY           37
+/*
+ * Cylon extension: a response-free x86 software-prefetch notification.
+ * The target GPA and x86 hint selector are carried in
+ * kvm_run.cylon_prefetch.  Userspace must initiate an asynchronous device
+ * fill and return without waiting for the modeled media completion.
+ */
+#define KVM_EXIT_CYLON_PREFETCH   38
 
 /* For KVM_EXIT_INTERNAL_ERROR */
 /* Emulate instruction failed. */
@@ -336,6 +345,12 @@ struct kvm_run {
 			__u32 len;
 			__u8  is_write;
 		} mmio;
+		/* KVM_EXIT_CYLON_PREFETCH */
+		struct {
+			__u64 phys_addr;
+			__u8 hint;
+			__u8 pad[7];
+		} cylon_prefetch;
 		/* KVM_EXIT_HYPERCALL */
 		struct {
 			__u64 nr;
@@ -1190,6 +1205,8 @@ struct kvm_ppc_resize_hpt {
 #define KVM_CAP_DIRTY_LOG_RING_WITH_BITMAP 225
 #define KVM_CAP_PMU_EVENT_MASKED_EVENTS 226
 #define KVM_CAP_COUNTER_OFFSET 227
+/* Cylon private ABI version returned by KVM_CHECK_EXTENSION. */
+#define KVM_CAP_CYLON_PREFETCH_EXIT 1000
 
 #ifdef KVM_CAP_IRQ_ROUTING
 

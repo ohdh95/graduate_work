@@ -66,6 +66,8 @@ typedef struct MemTxAttrs {
     unsigned int target_tlb_bit2 : 1;
 
     unsigned int dual_mode_dma   : 1;
+    /* One-way CPU software-prefetch notification for Cylon CXL memory. */
+    unsigned int cylon_prefetch  : 1;
 } MemTxAttrs;
 
 /* Bus masters which don't specify any attributes will get this,
@@ -75,6 +77,7 @@ typedef struct MemTxAttrs {
  */
 #define MEMTXATTRS_UNSPECIFIED ((MemTxAttrs) { .unspecified = 1 })
 #define MEMTXATTRS_DUAL_MODE_DMA_MAP ((MemTxAttrs) { .dual_mode_dma = 1 })
+#define MEMTXATTRS_CYLON_PREFETCH ((MemTxAttrs) { .cylon_prefetch = 1 })
 /* New-style MMIO accessors can indicate that the transaction failed.
  * A zero (MEMTX_OK) response means success; anything else is a failure
  * of some kind. The memory subsystem will bitwise-OR together results

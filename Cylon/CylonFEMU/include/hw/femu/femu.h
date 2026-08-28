@@ -1240,6 +1240,8 @@ typedef struct FemuCtrl {
     */
     uint8_t         buffer_way; 
     uint8_t         cxl_skip_ftl;
+    uint8_t         cxl_async_sw_prefetch;
+    uint32_t        cxl_async_max_inflight;
     uint64_t        base_gpa;
     
     MemoryRegion    iomem;
@@ -1401,9 +1403,17 @@ typedef struct FemuCtrl {
     pqueue_t        **pq;
     
     struct rte_ring *cxl_req;
+    struct rte_ring *cxl_prefetch_req;
+    QemuMutex       cxl_req_gate;
+    QemuMutex       cxl_control_gate;
+    bool            cxl_accept_requests;
+    bool            cxl_accept_prefetch;
+    bool            cxlssd_initialized;
+    uint32_t        cxl_prefetch_outstanding;
 
     bool            *should_isr;
     bool            poller_on;
+    bool            pollers_joined;
 
     int64_t         nr_tt_ios;
     int64_t         nr_tt_late_ios;
@@ -1525,6 +1535,7 @@ uint16_t femu_nvme_rw_check_req(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd,
 void nvme_process_sq_admin(void *opaque);
 void nvme_post_cqes_io(void *opaque);
 void *nvme_poller(void *arg);
+void nvme_quiesce_pollers(FemuCtrl *n);
 
 /* NVMe I/O */
 uint16_t nvme_rw(FemuCtrl *n, NvmeNamespace *ns, NvmeCmd *cmd, NvmeRequest *req);

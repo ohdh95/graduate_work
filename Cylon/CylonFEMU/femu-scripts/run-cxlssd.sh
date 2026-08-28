@@ -101,6 +101,8 @@ fi
 ssd_size=$1		# in MegaBytes
 bufsz=${CYLON_CACHE_SIZE_MIB:-$((ssd_size/20))}
 skip_ftl=${CYLON_CXL_SKIP_FTL:-0}
+async_sw_prefetch=${CYLON_ASYNC_SW_PREFETCH:-0}
+async_max_inflight=${CYLON_ASYNC_MAX_INFLIGHT:-4096}
 
 if [[ ! "$bufsz" =~ ^[0-9]+$ ]] || (( bufsz <= 0 || bufsz > ssd_size )); then
     echo "CYLON_CACHE_SIZE_MIB must be in [1, SSD size]" >&2
@@ -108,6 +110,19 @@ if [[ ! "$bufsz" =~ ^[0-9]+$ ]] || (( bufsz <= 0 || bufsz > ssd_size )); then
 fi
 if [[ ! "$skip_ftl" =~ ^[01]$ ]]; then
     echo "CYLON_CXL_SKIP_FTL must be 0 or 1" >&2
+    exit 1
+fi
+if [[ ! "$async_sw_prefetch" =~ ^[01]$ ]]; then
+    echo "CYLON_ASYNC_SW_PREFETCH must be 0 or 1" >&2
+    exit 1
+fi
+if [[ ! "$async_max_inflight" =~ ^[0-9]+$ ]] ||
+   (( async_max_inflight < 1 || async_max_inflight > 65536 )); then
+    echo "CYLON_ASYNC_MAX_INFLIGHT must be in [1,65536]" >&2
+    exit 1
+fi
+if (( async_sw_prefetch && prf_dg )); then
+    echo "CYLON_ASYNC_SW_PREFETCH=1 requires CYLON_PREFETCH_DEGREE=0" >&2
     exit 1
 fi
 
@@ -236,6 +251,8 @@ FEMU_OPTIONS=${FEMU_OPTIONS}",replacement=${policy}"
 FEMU_OPTIONS=${FEMU_OPTIONS}",prefetch_degree=${prf_dg}"
 FEMU_OPTIONS=${FEMU_OPTIONS}",buffer_way=${buffer_way}"
 FEMU_OPTIONS=${FEMU_OPTIONS}",cxl_skip_ftl=${skip_ftl}"
+FEMU_OPTIONS=${FEMU_OPTIONS}",cxl_async_sw_prefetch=${async_sw_prefetch}"
+FEMU_OPTIONS=${FEMU_OPTIONS}",cxl_async_max_inflight=${async_max_inflight}"
 FEMU_OPTIONS=${FEMU_OPTIONS}",multipoller_enabled=1"
 
 printf 'FEMU_OPTIONS=%s\n' "$FEMU_OPTIONS"

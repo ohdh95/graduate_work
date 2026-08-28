@@ -119,6 +119,25 @@ struct buffer {
     uint64_t cxl_mapped_nand_reads;
     uint64_t cxl_unmapped_read_alloc_writes;
     uint64_t cxl_modeled_nand_wait_ns;
+    uint64_t cxl_sw_prefetch_callbacks;
+    uint64_t cxl_sw_prefetch_enqueued;
+    uint64_t cxl_sw_prefetch_processed;
+    uint64_t cxl_sw_prefetch_dropped;
+    uint64_t cxl_sw_prefetch_admission_drops;
+    uint64_t cxl_sw_prefetch_queue_full_drops;
+    uint64_t cxl_sw_prefetch_outstanding_limit_drops;
+    uint64_t cxl_sw_prefetch_invalid_drops;
+    uint64_t cxl_sw_prefetch_unmapped_drops;
+    uint64_t cxl_sw_prefetch_inflight_cap_drops;
+    uint64_t cxl_sw_prefetch_hits;
+    uint64_t cxl_sw_prefetch_deduplicated;
+    uint64_t cxl_sw_prefetch_nand_reads;
+    uint64_t cxl_demand_inflight_joins;
+    uint64_t cxl_demand_joined_prefetch_fill;
+    uint64_t cxl_demand_joined_demand_fill;
+    uint64_t cxl_prefetch_unjoined_completions;
+    uint64_t cxl_async_fill_completions;
+    uint64_t cxl_async_inflight_peak;
     
     uint64_t gen;
 

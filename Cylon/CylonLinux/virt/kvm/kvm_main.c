@@ -1550,6 +1550,12 @@ static int check_memory_region_flags(const struct kvm_userspace_memory_region *m
 #ifdef KVM_MEMSLOT_DUAL_MODE
 	valid_flags |= KVM_MEMSLOT_DUAL_MODE;
 #endif
+#ifdef KVM_MEMSLOT_CYLON_PREFETCH
+	valid_flags |= KVM_MEMSLOT_CYLON_PREFETCH;
+	if ((mem->flags & KVM_MEMSLOT_CYLON_PREFETCH) &&
+	    !(mem->flags & KVM_MEMSLOT_DUAL_MODE))
+		return -EINVAL;
+#endif
 
 	if (mem->flags & ~valid_flags){
 		printk("flag %llx & %llx", (u64)mem->flags, (u64)~valid_flags);

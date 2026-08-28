@@ -65,6 +65,12 @@ See [docs/backend-memory-setup.md](docs/backend-memory-setup.md) for instruction
 
 ### Configuring Cylon
 * You can adjust Cylon configuration in `build-femu/run-cxlssd.sh` file.
+
+The experimental private-KVM path that turns guest CPU software-prefetch
+instructions into bounded asynchronous Cylon NAND fills is documented in
+[docs/async-sw-prefetch.md](docs/async-sw-prefetch.md). It is disabled by
+default and requires the matching `6.4.6-cylon-asyncpf` host kernel.
+
 #### Caching policy
 ```sh
 # CXL-SSD DRAM buffer parameters
