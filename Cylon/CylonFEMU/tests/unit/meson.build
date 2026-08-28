@@ -40,6 +40,11 @@ tests = {
   'test-bitops': [],
   'test-bitcnt': [],
   'test-qgraph': ['../qtest/libqos/qgraph.c'],
+  'test-femu-ftl-map-digest': [meson.project_source_root() / 'hw/femu/bbssd/ftl-map-digest.c'],
+  'test-femu-cxl-request-lifetime': [
+    meson.project_source_root() / 'hw/femu/cxlssd/cxl-request-lifetime.c',
+    meson.project_source_root() / 'hw/femu/lib/rte_ring.c',
+  ],
   'check-qom-interface': [qom],
   'check-qom-proplist': [qom],
   'test-qemu-opts': [],
@@ -171,7 +176,8 @@ test_env.set('G_TEST_BUILDDIR', meson.current_build_dir())
 
 slow_tests = {
   'test-crypto-tlscredsx509': 45,
-  'test-crypto-tlssession': 45
+  'test-crypto-tlssession': 45,
+  'test-femu-cxl-request-lifetime': 600
 }
 
 foreach test_name, extra: tests
@@ -195,3 +201,7 @@ foreach test_name, extra: tests
        priority: slow_tests.get(test_name, 30),
        suite: ['unit'])
 endforeach
+
+test('test-femu-spte-coherence', python,
+     args: files('test-femu-spte-coherence.py'),
+     suite: ['unit', 'femu'])

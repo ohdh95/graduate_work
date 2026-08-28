@@ -4,6 +4,7 @@
 #include "../nvme.h"
 // #include "ftl.h"
 typedef uint64_t lpn_t;
+#define BUFFER_VICTIM_TRACE_CAPACITY 256
 struct ssd;
 
 int flush_pg(struct ssd* ssd, lpn_t lpn);
@@ -108,6 +109,16 @@ struct buffer {
 
     uint64_t ins_cnt;
     uint64_t evict_cnt;
+    lpn_t victim_trace[BUFFER_VICTIM_TRACE_CAPACITY];
+    uint64_t victim_trace_count;
+    uint64_t victim_trace_dropped;
+
+    /* CXL path-breakdown counters, reset with the existing stats window. */
+    uint64_t cxl_mmio_read_callbacks;
+    uint64_t cxl_skip_ftl_bypasses;
+    uint64_t cxl_mapped_nand_reads;
+    uint64_t cxl_unmapped_read_alloc_writes;
+    uint64_t cxl_modeled_nand_wait_ns;
     
     uint64_t gen;
 

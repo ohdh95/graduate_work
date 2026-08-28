@@ -3,6 +3,8 @@
 
 #include "../nvme.h"
 #include "buffer.h"
+#include "ftl-map-digest.h"
+#include "../cxlssd/cxl-request-lifetime.h"
 
 #define INVALID_PPA     (~(0ULL))
 #define INVALID_LPN     (~(0ULL))
@@ -217,17 +219,19 @@ enum {
     BUF_CLEAR,
     SSD_INIT,
     INC_PREFETCH_DEGREE,
+    FTL_MAP_DIGEST,
 };
 
 struct cxl_req {
     /* request */
-    struct nand_cmd *ncmd;
+    struct nand_cmd ncmd;
     lpn_t lpn;
+    bool map_digest_requested;
 
     /* response */
     uint64_t expire_time;
-
-    size_t pos;
+    CylonFtlMapDigest map_digest;
+    CylonCxlRequestLifetime lifetime;
 };
 
 struct ssd {
@@ -247,13 +251,14 @@ struct ssd {
     struct rte_ring **to_poller;
 
     struct rte_ring *cxl_req;
-    struct rte_ring *cxl_resp;
 
     struct buffer dram_buffer;
 
     bool *dataplane_started_ptr;
     QemuThread ftl_thread;
 };
+
+void cylon_cxl_req_put(struct cxl_req *creq);
 
 void ssd_init(FemuCtrl *n);
 void ssd_reset(FemuCtrl *n);

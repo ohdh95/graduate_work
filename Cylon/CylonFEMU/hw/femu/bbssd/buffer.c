@@ -193,6 +193,21 @@ static int comp_buffer(const void *a, const void *b){
 	return ((struct buffer_entry*)a)->lpn - ((struct buffer_entry*)b)->lpn;
 }
 
+static void buffer_clear_active_entry(struct buffer *buffer,
+				      struct buffer_entry *entry)
+{
+	/*
+	 * direct_mr_del() does not return until KVM has synchronously
+	 * invalidated this direct translation.  Thus an entry is never freed,
+	 * and buffer_clear() never returns to its control request, while a
+	 * stale direct-EPT translation can still bypass the CXL trap path.
+	 */
+	flush_pg(buffer->ssd, entry->lpn);
+	g_tree_remove(buffer->tree, entry);
+	direct_mr_del(buffer, entry->lpn);
+	free(entry);
+}
+
 void buffer_clear(struct buffer *buffer)
 {
 	int n_way = 1 << buffer->way;
@@ -209,10 +224,8 @@ void buffer_clear(struct buffer *buffer)
     if (buffer->way == WAY_1) {
         for (int i = 0; i < n_set; i++) {
 			if (buffer->sets[i].entry) {
-				g_tree_remove(buffer->tree, buffer->sets[i].entry);
-				flush_pg(buffer->ssd, buffer->sets[i].entry->lpn);
-				direct_mr_del(buffer, buffer->sets[i].entry->lpn);
-				free(buffer->sets[i].entry);
+				buffer_clear_active_entry(buffer, buffer->sets[i].entry);
+				buffer->sets[i].entry = NULL;
 			}
 				
 			buffer->sets[i].cnt = 0;
@@ -225,22 +238,44 @@ void buffer_clear(struct buffer *buffer)
 			while(!QTAILQ_EMPTY(&set->queue)) {
 				struct buffer_entry *ent = QTAILQ_FIRST(&set->queue);
 				QTAILQ_REMOVE(&set->queue, ent, b_entry);
-				
-				flush_pg(buffer->ssd, ent->lpn);
-				g_tree_remove(buffer->tree, ent);	//remove from avl tree
-				direct_mr_del(buffer, ent->lpn);
+				buffer_clear_active_entry(buffer, ent);
+			}
 
-				free(ent);
+			if (buffer->policy == S3FIFO) {
+				while (!QTAILQ_EMPTY(&set->small)) {
+					struct buffer_entry *ent = QTAILQ_FIRST(&set->small);
+					QTAILQ_REMOVE(&set->small, ent, b_entry);
+					buffer_clear_active_entry(buffer, ent);
+				}
+				while (!QTAILQ_EMPTY(&set->ghost)) {
+					struct buffer_entry *ent = QTAILQ_FIRST(&set->ghost);
+					QTAILQ_REMOVE(&set->ghost, ent, b_entry);
+					g_tree_remove(buffer->ghost_tree, ent);
+					free(ent);
+				}
+				QTAILQ_INIT(&set->small);
+				QTAILQ_INIT(&set->ghost);
+				set->cnt_small = 0;
+				set->cnt_main = 0;
+				set->cnt_ghost = 0;
 			}
 			buffer->sets[i].cnt = 0;
 			buffer->sets[i].hand = NULL;
 			QTAILQ_INIT(&set->queue);
-			QTAILQ_INIT(&set->tmp);
+			if (buffer->policy != S3FIFO) {
+				QTAILQ_INIT(&set->tmp);
+			}
 		}
 	}
 
-	
+	if (buffer->tree) {
+		g_tree_destroy(buffer->tree);
+	}
 	buffer->tree = g_tree_new(comp_buffer);
+	if (buffer->ghost_tree) {
+		g_tree_destroy(buffer->ghost_tree);
+	}
+	buffer->ghost_tree = g_tree_new(comp_buffer);
 	// b->bitmap = bitmap_new(b->size);
 
     buffer->read_hit = buffer->read_miss = 0; 
@@ -249,6 +284,13 @@ void buffer_clear(struct buffer *buffer)
 
 	buffer->ins_cnt = 0;
 	buffer->evict_cnt = 0;
+	buffer->victim_trace_count = 0;
+	buffer->victim_trace_dropped = 0;
+	qatomic_set(&buffer->cxl_mmio_read_callbacks, 0);
+	qatomic_set(&buffer->cxl_skip_ftl_bypasses, 0);
+	qatomic_set(&buffer->cxl_mapped_nand_reads, 0);
+	qatomic_set(&buffer->cxl_unmapped_read_alloc_writes, 0);
+	qatomic_set(&buffer->cxl_modeled_nand_wait_ns, 0);
 }
 
 void buffer_init_set(struct buffer* buffer)

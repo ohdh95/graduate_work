@@ -1,8 +1,27 @@
 #include "ftl.h"
+#include <sys/syscall.h>
 
 //#define FEMU_DEBUG_FTL
 
 static void *ftl_thread(void *arg);
+
+void cylon_cxl_req_put(struct cxl_req *creq)
+{
+    if (cylon_cxl_request_put(&creq->lifetime)) {
+        g_free(creq);
+    }
+}
+
+static inline void complete_cxl_req(struct cxl_req *creq)
+{
+    if (!cylon_cxl_request_complete(&creq->lifetime, NULL, NULL)) {
+        ftl_err("CXL request completion state differs: seq=%" PRIu64
+                " state=%u\n", creq->lifetime.sequence,
+                cylon_cxl_request_state(&creq->lifetime));
+        abort();
+    }
+    cylon_cxl_req_put(creq);
+}
 
 static inline bool should_gc(struct ssd *ssd)
 {
@@ -23,6 +42,41 @@ static inline void set_maptbl_ent(struct ssd *ssd, lpn_t lpn, struct ppa *ppa)
 {
     ftl_assert(lpn < ssd->sp.tt_pgs);
     ssd->maptbl[lpn] = *ppa;
+}
+
+static void compute_ftl_map_digest(struct ssd *ssd,
+                                   CylonFtlMapDigest *result)
+{
+    const struct ssdparams *spp = &ssd->sp;
+    const CylonFtlMapGeometry geometry = {
+        .blk_bits = BLK_BITS,
+        .pg_bits = PG_BITS,
+        .sec_bits = SEC_BITS,
+        .pl_bits = PL_BITS,
+        .lun_bits = LUN_BITS,
+        .ch_bits = CH_BITS,
+        .rsv_bits = 1,
+        .sector_bytes = spp->secsz,
+        .sectors_per_page = spp->secs_per_pg,
+        .pages_per_block = spp->pgs_per_blk,
+        .blocks_per_plane = spp->blks_per_pl,
+        .planes_per_lun = spp->pls_per_lun,
+        .luns_per_channel = spp->luns_per_ch,
+        .channels = spp->nchs,
+        .lpn_count = spp->tt_pgs,
+    };
+
+    /*
+     * This executes in the sole FTL consumer.  No mapping mutation can
+     * interleave with the snapshot, so completion is also a mapping barrier
+     * for every earlier CXL request on the queue.
+     */
+    if (!cylon_ftl_map_digest_compute(&geometry, ssd->maptbl,
+                                      sizeof(ssd->maptbl[0]),
+                                      offsetof(struct ppa, ppa), result)) {
+        ftl_err("failed to compute canonical FTL mapping digest\n");
+        abort();
+    }
 }
 
 static uint64_t ppa2pgidx(struct ssd *ssd, struct ppa *ppa)
@@ -398,6 +452,14 @@ static void buffer_init(struct ssd *ssd)
 
     buffer->read_hit = buffer->read_miss = 0; 
     buffer->write_hit = buffer->write_miss = 0;
+    buffer->ins_cnt = buffer->evict_cnt = 0;
+    buffer->victim_trace_count = 0;
+    buffer->victim_trace_dropped = 0;
+    buffer->cxl_mmio_read_callbacks = 0;
+    buffer->cxl_skip_ftl_bypasses = 0;
+    buffer->cxl_mapped_nand_reads = 0;
+    buffer->cxl_unmapped_read_alloc_writes = 0;
+    buffer->cxl_modeled_nand_wait_ns = 0;
 
 	switch (buffer->policy)
 	{
@@ -1083,6 +1145,9 @@ static void *ftl_thread(void *arg)
     int rc;
     int i;
 
+    femu_log("FEMU-FTL-Thread-TID: %ld\n", syscall(SYS_gettid));
+    fflush(stdout);
+
     while (!*(ssd->dataplane_started_ptr)) {
         usleep(100000);
     }
@@ -1092,7 +1157,6 @@ static void *ftl_thread(void *arg)
     ssd->to_poller = n->to_poller;
 
     ssd->cxl_req = n->cxl_req;
-    ssd->cxl_resp = n->cxl_resp;
 
     struct buffer *buffer = &ssd->dram_buffer;
 #ifdef LSA_TROLL    
@@ -1115,11 +1179,18 @@ static void *ftl_thread(void *arg)
                 
                 rc = femu_ring_dequeue(ssd->cxl_req, (void *)&creq, 1);
                 if (rc != 1) {
-                    printf("FEMU: FTL cxl_req dequeue failed\n");
+                    ftl_err("CXL request dequeue failed\n");
+                    abort();
                 }
                 assert(creq != NULL);
+                if (!cylon_cxl_request_mark_dequeued(&creq->lifetime)) {
+                    ftl_err("CXL request dequeue state differs: seq=%" PRIu64
+                            " state=%u\n", creq->lifetime.sequence,
+                            cylon_cxl_request_state(&creq->lifetime));
+                    abort();
+                }
 #ifdef LSA_TROLL
-                switch (creq->ncmd->cmd) {
+                switch (creq->ncmd.cmd) {
                 case BUF_PRINT_STAT:
                     skip = true;
                     break;
@@ -1136,27 +1207,35 @@ static void *ftl_thread(void *arg)
                     // ssd_init_buffer(n);
                     skip = true;
                     break;
+                case FTL_MAP_DIGEST:
+                    if (!creq->map_digest_requested) {
+                        ftl_err("FTL_MAP_DIGEST request has no result buffer\n");
+                        abort();
+                    }
+                    compute_ftl_map_digest(ssd, &creq->map_digest);
+                    skip = true;
+                    break;
                 }
 
                 if (skip) {
                     skip = false;
-                    rc = femu_ring_enqueue(ssd->cxl_resp, (void *)&creq, 1);
+                    complete_cxl_req(creq);
                     continue;
                 }
 #endif
                 lpn = creq->lpn;
                 lat = 0;
-                read = (creq->ncmd->cmd == CXL_READ);
+                read = (creq->ncmd.cmd == CXL_READ);
                 // printf("[CXL]: lpn(0x%lx) %s\n", lpn, read?"READ":"WRITE");
 
                 bentry = buffer_lookup_entry(buffer, lpn);
                 if (bentry) {//buffer hit
-                    rc = femu_ring_enqueue(ssd->cxl_resp, (void *)&creq, 1);
                     bentry->dirty = (bentry->dirty==false && read)?false:true;
 
                     if (read)   buffer->read_hit++;
                     else        buffer->write_hit++;
                     buffer_insert_entry(buffer, bentry, INSERT_NO_PREFETCH);
+                    complete_cxl_req(creq);
                 }
                 else {//buffer miss: fetch from NAND
                     bentry = buffer_entry_init(buffer, lpn);
@@ -1167,8 +1246,9 @@ static void *ftl_thread(void *arg)
                     
                     ppa = get_maptbl_ent(ssd, lpn);
                     if (mapped_ppa(&ppa) && valid_ppa(ssd, &ppa)) {
-                        creq->ncmd->cmd = NAND_READ;
-                        lat += ssd_advance_status(ssd, &ppa, creq->ncmd);
+                        creq->ncmd.cmd = NAND_READ;
+                        lat += ssd_advance_status(ssd, &ppa, &creq->ncmd);
+                        qatomic_inc(&buffer->cxl_mapped_nand_reads);
                         // backend_memcpy(ssd, ppa, bentry->idx, NAND_TO_BUF);
                     }
                     else {
@@ -1186,14 +1266,18 @@ static void *ftl_thread(void *arg)
                         mark_page_valid(ssd, &new_ppa);
                         ssd_advance_write_pointer(ssd);
 
-                        creq->ncmd->cmd = NAND_WRITE;
-                        lat += ssd_advance_status(ssd, &new_ppa, creq->ncmd);
+                        creq->ncmd.cmd = NAND_WRITE;
+                        lat += ssd_advance_status(ssd, &new_ppa, &creq->ncmd);
+                        if (read) {
+                            qatomic_inc(
+                                &buffer->cxl_unmapped_read_alloc_writes);
+                        }
                         
                     }
+                    qatomic_add(&buffer->cxl_modeled_nand_wait_ns, lat);
                     creq->expire_time += lat;
-                    rc = femu_ring_enqueue(ssd->cxl_resp, (void *)&creq, 1);
-
                     buffer_insert_entry(buffer, bentry, INSERT_PREFETCH);
+                    complete_cxl_req(creq);
                 }
                 /* clean one line if needed (in the background) */
                 if (should_gc(ssd)) {

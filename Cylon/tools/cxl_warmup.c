@@ -1,33 +1,61 @@
-#include <sys/ioctl.h>                                                                                                                              [21/237]
-#include <stdint.h>
-#include <time.h>
-
-#define MMAP_SIZE ((uint64_t)96*1024*1024*1024)
-
+#include <fcntl.h>
 #include <omp.h>
-int main(int argc, char** argv){
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/mman.h>
+#include <unistd.h>
 
-    uint64_t sz = MMAP_SIZE;
-    if (argc==2)
-        sz = (uint64_t)atoi(argv[1])*1024*1024*1024;
+#define DEFAULT_MMAP_SIZE_GIB 96ULL
+
+int main(int argc, char **argv)
+{
+    uint64_t size_gib = DEFAULT_MMAP_SIZE_GIB;
+
+    if (argc == 2) {
+        char *end = NULL;
+        unsigned long long parsed = strtoull(argv[1], &end, 10);
+
+        if (*argv[1] == '\0' || *end != '\0' || parsed == 0) {
+            fprintf(stderr, "usage: %s [size_GiB]\n", argv[0]);
+            return EXIT_FAILURE;
+        }
+        size_gib = parsed;
+    } else if (argc > 2) {
+        fprintf(stderr, "usage: %s [size_GiB]\n", argv[0]);
+        return EXIT_FAILURE;
     }
 
-    uint64_t *cxl = (uint64_t*)mmap(NULL, sz, PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
+    const uint64_t size = size_gib * 1024ULL * 1024ULL * 1024ULL;
+
+    printf("FEMU CXL-SSD warm-up: touching one byte per 4 KiB page\n");
+    printf("Size: %llu GiB\n", (unsigned long long)size_gib);
+
+    int fd = open("/dev/dax0.0", O_RDWR);
+    if (fd < 0) {
+        perror("open /dev/dax0.0");
+        return EXIT_FAILURE;
+    }
+
+    uint8_t *cxl = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     if (cxl == MAP_FAILED) {
-        perror("mmap: ");
-        exit(0);
-    }
-    int a = 0;
-    printf("Size: %.1f GB\n", sz/1024./1024./1024.);
-
-    #pragma omp parallel for num_threads(8)
-    for (uint64_t i=0;i<sz/8;i+=4096/8) {
-        cxl[i] = 0;
+        perror("mmap /dev/dax0.0");
+        close(fd);
+        return EXIT_FAILURE;
     }
 
-    munmap(cxl, sz);
+#pragma omp parallel for num_threads(8) schedule(static)
+    for (uint64_t offset = 0; offset < size; offset += 4096) {
+        cxl[offset] = 0;
+    }
+
+    if (munmap(cxl, size) != 0) {
+        perror("munmap");
+        close(fd);
+        return EXIT_FAILURE;
+    }
 
     close(fd);
-    printf("Done\n");
-    return 0;
+    puts("Done");
+    return EXIT_SUCCESS;
 }

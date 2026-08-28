@@ -71,55 +71,97 @@ static inline u64 dualslot_get_leaf_spt_idx(u64 lpn)
 	return (lpn * sizeof(u64*)) >> (MAX_ORDER + PAGE_SHIFT);
 }
 
-static int kvm_set_spte_flag(uint64_t gfn, lpn_t lpn, uint64_t flag)
+/*
+ * KVM_SET_SPTE_FLAG with flag == 0 is the only userspace ABI that this
+ * file can use to synchronously invalidate a hardware translation.  The
+ * custom kernel currently falls back to a VM-wide shootdown on bare-metal
+ * Intel, but the ABI promises only the single GFN passed in data.gpa.
+ * Consequently callers must issue this once for every direct->MMIO
+ * transition; coalescing unrelated GFNs into one ioctl would be incorrect
+ * on a host that implements range-aware invalidation.
+ */
+static int kvm_flush_spte_tlb(uint64_t gfn, lpn_t lpn)
 {
-    int r = -1;
-    uint64_t now__;
-
     struct kvm_set_spte_flag data = (struct kvm_set_spte_flag) {
-        .gpa = gfn <<12,
-        .flag = flag,
+        .gpa = gfn << PAGE_SHIFT,
+        .flag = 0,
         .lpn = lpn,
     };
-
     struct CPUState *cpu = qemu_get_cpu(0);
-    assert(cpu);
-    // printf("FEMU kvm_vcpu_ioctl (%lx, %lx, %lx)", gfn, uaddr, flag);
-    
-    now__ = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
-    r = kvm_vcpu_ioctl(cpu, KVM_SET_SPTE_FLAG, &data);
-    now__ = qemu_clock_get_ns(QEMU_CLOCK_REALTIME) - now__;
-    // fprintf(kvm_ioctl_log_file, "%ld ",now__);
-    
-    // if (r != 0) printf("[%lx,%d] ", gfn, r);
-    if (r != 0)
-        printf("[%s] gfn:%lx error[%d]\n",__func__, gfn, r);
-    // else
-    //     printf("%s: %lx done\n",__func__, gfn);
+    int ret;
 
-    return r==0?1:0;
+    if (!cpu) {
+        return -ENODEV;
+    }
+
+    ret = kvm_vcpu_ioctl(cpu, KVM_SET_SPTE_FLAG, &data);
+    return ret;
 }
 
 #define DIRECT_MASK  0x600000000000977
 #define MMIO_MASK  0x0000000586
 
-static u64* dualslot_get_sptep(u64 lpn)
+static void spte_fail_closed(const char *operation, uint64_t gfn, lpn_t lpn,
+                             int error)
 {
-    if (init == false) {
-        printf("%s spt not initialized\n", __func__);
-        abort();
-        // init_spt(mem);
-        // init = true;
+    if (error < 0) {
+        femu_err("%s failed for gfn=0x%" PRIx64 ", lpn=0x%" PRIx64
+                 ": %s (%d); stopping to avoid a stale direct mapping\n",
+                 operation, gfn, lpn, strerror(-error), error);
+    } else {
+        femu_err("%s failed for gfn=0x%" PRIx64 ", lpn=0x%" PRIx64
+                 "; stopping to avoid a stale direct mapping\n",
+                 operation, gfn, lpn);
+    }
+    abort();
+}
 
-        test_spte_modify();
+static u64 *dualslot_get_sptep(u64 lpn)
+{
+    const u64 entries_per_page = (1ULL << PAGE_SHIFT) / sizeof(u64);
+    u64 chunk_base;
+    u64 chunk_entries;
+    u64 off;
+    size_t idx;
+    u64 *sptep;
+
+    if (!init || !femu || !femu->mbe) {
+        spte_fail_closed("SPTE lookup before initialization", 0, lpn, 0);
     }
 
-	int idx = dualslot_get_leaf_spt_idx(lpn);
-    int off = lpn - spt.spt_list[idx].offset*512;
-    // if (idx > 0)
-    //     printf("lpn:0x%llx, idx:%d, off:0x%x, npg_off:0x%x\n",lpn, idx, off, spt.spt_list[idx].offset);
+    if (lpn >= (femu->mbe->size >> PAGE_SHIFT)) {
+        spte_fail_closed("out-of-range SPTE lookup", 0, lpn, -ERANGE);
+    }
 
-    return spt.spt_list[idx].spt + off;
+    idx = dualslot_get_leaf_spt_idx(lpn);
+    if (spt.n <= 0 || idx >= (size_t)spt.n ||
+        idx >= ARRAY_SIZE(spt.spt_list) ||
+        !spt.spt_list[idx].spt || spt.spt_list[idx].npages <= 0) {
+        spte_fail_closed("invalid linear-SPT chunk", 0, lpn, -EINVAL);
+    }
+
+    chunk_base = (u64)spt.spt_list[idx].offset * entries_per_page;
+    chunk_entries = (u64)spt.spt_list[idx].npages * entries_per_page;
+    if (lpn < chunk_base || lpn - chunk_base >= chunk_entries) {
+        spte_fail_closed("linear-SPT offset mismatch", 0, lpn, -ERANGE);
+    }
+
+    off = lpn - chunk_base;
+    sptep = spt.spt_list[idx].spt + off;
+    if ((uintptr_t)sptep % sizeof(*sptep)) {
+        spte_fail_closed("unaligned SPTE", 0, lpn, -EFAULT);
+    }
+
+    return sptep;
+}
+
+static void validate_spte_gfn(uint64_t gfn, lpn_t lpn)
+{
+    uint64_t expected_gfn = (femu->mbe->base_gpa >> PAGE_SHIFT) + lpn;
+
+    if (gfn != expected_gfn) {
+        spte_fail_closed("GFN/LPN mismatch", gfn, lpn, -EINVAL);
+    }
 }
 
 static inline u64 make_mmio_spte(u64 gfn)
@@ -161,32 +203,39 @@ static inline u64 make_direct_spte(u64 lpn)
 int femu_kvm_spte_set_mmio_flag(uint64_t gfn, lpn_t lpn)
 {
     u64 *sptep = dualslot_get_sptep(lpn);
-    u64 prev = *sptep;
-    *sptep = make_mmio_spte(gfn);
-    
-    return 0;
-    // /* Not reached */
-    // return kvm_set_spte_flag(gfn, lpn, 0);
+    int ret;
 
-    kvm_set_spte_flag(gfn, lpn, 0x576);
-    sptep = dualslot_get_sptep(lpn);
-    printf("%s, [gfn:0x%lx, lpn:0x%lx] change from 0x%llx to 0x%llx\n", __func__, gfn, lpn, prev, *sptep);
+    validate_spte_gfn(gfn, lpn);
+
+    /*
+     * SPTEs are naturally aligned 64-bit words.  Publish the non-present
+     * MMIO SPTE atomically and with a full barrier before asking KVM to
+     * invalidate remote hardware TLBs.  The ioctl is synchronous: returning
+     * from this function is therefore the eviction visibility point.
+     */
+    qatomic_set_mb(sptep, make_mmio_spte(gfn));
+    ret = kvm_flush_spte_tlb(gfn, lpn);
+    if (ret) {
+        spte_fail_closed("KVM direct-to-MMIO TLB shootdown", gfn, lpn, ret);
+    }
+
     return 0;
 }
 
 int femu_kvm_spte_clear_mmio_flag(uint64_t gfn, lpn_t lpn)
 {
     u64 *sptep = dualslot_get_sptep(lpn);
-    u64 prev = *sptep;
-    *sptep = make_direct_spte(lpn);
-    // printf("%s, [gfn:0x%lx, lpn:0x%lx] change from 0x%llx to 0x%llx\n", __func__, gfn, lpn, prev, *sptep);
-    return 0;
-    /* Not reached */
-    // return kvm_set_spte_flag(gfn, lpn, 0);
-    
-    kvm_set_spte_flag(gfn, lpn, 0x1);
-    sptep = dualslot_get_sptep(lpn);
-    printf("%s, [gfn:0x%lx, lpn:0x%lx] change from 0x%llx to 0x%llx\n", __func__, gfn, lpn, prev, *sptep);
+
+    validate_spte_gfn(gfn, lpn);
+
+    /*
+     * MMIO SPTEs are non-present, so the CPU cannot retain a successful
+     * MMIO->direct hardware translation.  An atomic, ordered store is enough
+     * for the next page walk.  Re-flushing here would add a global shootdown
+     * to every cache insertion/hit on the current host without strengthening
+     * the direct->MMIO eviction guarantee above.
+     */
+    qatomic_set_mb(sptep, make_direct_spte(lpn));
     return 0;
 }
 

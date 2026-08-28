@@ -29,6 +29,14 @@ int fifo_evict_victim(struct buffer *b, struct set *set)
 	g_tree_remove(b->tree, victim);	//remove from avl tree
 	direct_mr_del(b, victim->lpn);
 
+	b->evict_cnt++;
+	if (b->victim_trace_count < BUFFER_VICTIM_TRACE_CAPACITY) {
+		b->victim_trace[b->victim_trace_count++] = victim->lpn;
+	}
+	else {
+		b->victim_trace_dropped++;
+	}
+
 	free(victim);
 	b->entry_cnt--;
 	set->cnt--;
@@ -69,6 +77,7 @@ int fifo_insert_entry(struct buffer *b, struct buffer_entry *eptr)
 
 		b->entry_cnt++;
 		set->cnt++;
+		b->ins_cnt++;
 		
 		return 1;
 	}
@@ -79,4 +88,3 @@ int fifo_insert_entry(struct buffer *b, struct buffer_entry *eptr)
 	/* If the entry is already in buffer, just return*/
 	return 0;
 }
-

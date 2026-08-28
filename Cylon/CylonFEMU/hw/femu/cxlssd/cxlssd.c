@@ -1,7 +1,56 @@
 #include "../nvme.h"
 #include "../bbssd/ftl.h"
 #include "../kvm_ext.h"
+#include <inttypes.h>
+#include "qemu/main-loop.h"
 FILE *mem_acc_log_file;
+static uint64_t cxl_request_sequence;
+
+static struct cxl_req *cxl_request_new(int command, lpn_t lpn,
+                                       uint64_t start_time,
+                                       bool map_digest_requested)
+{
+    struct cxl_req *request = g_new0(struct cxl_req, 1);
+    uint64_t sequence = qatomic_fetch_inc(&cxl_request_sequence) + 1;
+
+    if (sequence == 0) {
+        femu_err("CXL request sequence wrapped\n");
+        abort();
+    }
+
+    request->ncmd.type = USER_IO;
+    request->ncmd.cmd = command;
+    request->ncmd.stime = start_time;
+    request->lpn = lpn;
+    request->expire_time = start_time;
+    request->map_digest_requested = map_digest_requested;
+    cylon_cxl_request_lifetime_init(&request->lifetime, sequence);
+    return request;
+}
+
+static void cxl_request_enqueue(FemuCtrl *n, struct cxl_req *request)
+{
+    int rc;
+
+    if (!cylon_cxl_request_mark_enqueued(&request->lifetime)) {
+        femu_err("CXL request publish state differs: seq=%" PRIu64
+                 " state=%u\n", request->lifetime.sequence,
+                 cylon_cxl_request_state(&request->lifetime));
+        abort();
+    }
+
+    rc = femu_ring_enqueue(n->cxl_req, (void *)&request, 1);
+    if (rc != 1) {
+        femu_err("CXL request enqueue failed: seq=%" PRIu64 " ret=%d\n",
+                 request->lifetime.sequence, rc);
+        if (!cylon_cxl_request_cancel_unpublished(&request->lifetime)) {
+            femu_err("CXL request cancellation state differs\n");
+            abort();
+        }
+        g_free(request);
+        abort();
+    }
+}
 
 static void cxlssd_init_ctrl_str(FemuCtrl *n)
 {
@@ -10,32 +59,6 @@ static void cxlssd_init_ctrl_str(FemuCtrl *n)
     const char *vcxlssdssd_sn = "vSSD";
 
     nvme_set_ctrl_name(n, vcxlssdssd_mn, vcxlssdssd_sn, &fsid_vcxlssd);
-}
-
-
-static int cmp_pri(pqueue_pri_t next, pqueue_pri_t curr)
-{
-    return (next > curr);
-}
-
-static pqueue_pri_t get_pri(void *a)
-{
-    return ((struct cxl_req *)a)->expire_time;
-}
-
-static void set_pri(void *a, pqueue_pri_t pri)
-{
-    ((struct cxl_req *)a)->expire_time = pri;
-}
-
-static size_t get_pos(void *a)
-{
-    return ((struct cxl_req *)a)->pos;
-}
-
-static void set_pos(void *a, size_t pos)
-{
-    ((struct cxl_req *)a)->pos = pos;
 }
 
 
@@ -59,16 +82,6 @@ static void cxlssd_init(FemuCtrl *n, Error **errp)
         femu_err("Failed to create ring (n->cxl_req) ...\n");
         abort();
     }
-    n->cxl_resp = femu_ring_create(FEMU_RING_TYPE_MP_SC, FEMU_MAX_INF_REQS);
-    if (!n->cxl_resp) {
-        femu_err("Failed to create ring (n->cxl_resp) ...\n");
-        abort();
-    }
-    n->cxl_pq = pqueue_init(FEMU_MAX_INF_REQS, cmp_pri, get_pri, set_pri, get_pos, set_pos);
-    if (!n->cxl_pq) {
-        femu_err("Failed to create pqueue (n->cxl_pq) ...\n");
-        abort();
-    }
     
     femu_kvm_set_user_memory_region(n);
     ssd_init(n);
@@ -83,9 +96,6 @@ static void cxlssd_exit(FemuCtrl *n)
 {
 
     femu_ring_free(n->cxl_req);
-    femu_ring_free(n->cxl_resp);
-
-    pqueue_free(n->cxl_pq);
 
     femu_kvm_del_user_memory_region(n);
     ssd_reset(n);
@@ -169,125 +179,44 @@ static uint16_t cxlssd_admin_cmd(FemuCtrl *n, NvmeCmd *cmd)
 
 static void wait_for_buf_update(FemuCtrl *n, uint64_t addr, int c)
 {   
-    int rc;
+    bool had_bql;
     uint64_t now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
     lpn_t lpn = addr >> 12;
-    
-    struct nand_cmd cmd = (struct nand_cmd) {
-        .type = USER_IO,
-        .cmd = c,
-        .stime = now,
-    };
+    struct cxl_req *myreq = cxl_request_new(c, lpn, now, false);
 
-    struct cxl_req creq = (struct cxl_req) {
-        .ncmd = &cmd,
-        .lpn = lpn,
-        .expire_time = now,
-    };
+    /* Send the request to the single FTL consumer. */
+    cxl_request_enqueue(n, myreq);
 
-    struct cxl_req *myreq = malloc(sizeof(struct cxl_req));
-    memcpy(myreq, &creq, sizeof(struct cxl_req));
-    // &creq;
-    struct cxl_req *req = NULL;
-
-    /* send requesst*/
-    // qemu_mutex_lock(&n->mutex);
-    rc = femu_ring_enqueue(n->cxl_req, (void *)&myreq, 1);
-    // qemu_mutex_unlock(&n->mutex);
-    if (rc != 1) {
-        femu_err("enqueue failed, ret=%d\n", rc);
+    /*
+     * Each producer waits only for its own request.  qemu_event_set/wait
+     * publishes expire_time without a shared response queue or dispatcher.
+     *
+     * KVM MMIO enters this callback with the BQL held.  Do not retain that
+     * global lock while waiting for the FTL and the modeled NAND completion:
+     * doing so limits the CXL request queue to one outstanding vCPU request
+     * and hides channel/LUN parallelism.  Device lookup, backing-memory
+     * access, enqueue, and request destruction remain under the caller's
+     * original BQL scope.
+     */
+    had_bql = qemu_mutex_iothread_locked();
+    if (had_bql) {
+        qemu_mutex_unlock_iothread();
     }
-    
-    pqueue_t *pq = n->cxl_pq;
-    struct rte_ring *rp = n->cxl_resp;
-    bool recvd = false;
-
-    
-    // if (qemu_mutex_trylock(&n->mutex)) {
-    //     qemu_mutex_unlock(&n->mutex);
-    // }
-    // else {
-    //     femu_err("[tid %d]: Failed to lock mutex, cannot wait for buf update\n", gettid());
-    // }
-
-
-    // while (!recvd) {
-    //     /* flush response Q */
-    //     while (true) {
-    //         qemu_mutex_lock(&n->mutex);
-    //         if (femu_ring_count(rp) == 0) {
-    //             qemu_mutex_unlock(&n->mutex);
-    //             break;
-    //         }
-
-    //         req = NULL;
-    //         rc = femu_ring_dequeue(rp, (void *)&req, 1);
-    //         if (rc != 1) {
-    //             femu_err("dequeue from to_poller request failed\n");
-    //         }
-    //         assert(req);
-    
-    //         pqueue_insert(pq, req);
-    //         qemu_mutex_unlock(&n->mutex);
-    //     }
-
-    //     /* Wait for my response */
-    //     while (true) {
-            
-    //         qemu_mutex_lock(&n->mutex);
-    //         req = pqueue_peek(pq);
- 
-    //         if (myreq != req) {
-    //             qemu_mutex_unlock(&n->mutex);
-    //             continue;
-    //         }
-            
-    //         recvd = true;
-    //         pqueue_pop(pq);
-    //         qemu_mutex_unlock(&n->mutex);
-            
-    //         do {
-    //             now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);  
-    //         } while(now < req->expire_time);
-
-    //         break;
-    //     }
-    // }
-    
-
-    while (!recvd) {
-        /* flush response Q */
-        while (femu_ring_count(rp)) {
-            
-            req = NULL;
-            rc = femu_ring_dequeue(rp, (void *)&req, 1);
-            if (rc != 1) {
-                femu_err("dequeue from to_poller request failed\n");
-            }
-            assert(req);
-    
-            pqueue_insert(pq, req);
-        }
-
-        /* Wait for my response */
-        while ((req = pqueue_peek(pq))) {
-            if (myreq != req) {
-                continue;
-            }
-            
-            recvd = true;
-            pqueue_pop(pq);
-            do {
-                now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);  
-            } while(now < req->expire_time);
-
-            // printf("addr 0x%lx, start: %ld, end: %ld, duration: %ld, actual: %ld\n", addr, creq.expire_time, req->expire_time, req->expire_time-creq.expire_time, now-creq.expire_time);
-            break;
-        }
+    if (!cylon_cxl_request_wait(&myreq->lifetime)) {
+        femu_err("CXL request wait state differs: seq=%" PRIu64
+                 " state=%u\n", myreq->lifetime.sequence,
+                 cylon_cxl_request_state(&myreq->lifetime));
+        abort();
     }
-    
+    const uint64_t expire_time = myreq->expire_time;
+    do {
+        now = qemu_clock_get_ns(QEMU_CLOCK_REALTIME);
+    } while (now < expire_time);
+    if (had_bql) {
+        qemu_mutex_lock_iothread();
+    }
 
-    free(myreq);
+    cylon_cxl_req_put(myreq);
 }
 
 // #include <execinfo.h>
@@ -312,7 +241,9 @@ static MemTxResult cxlssd_mem_read(void *opaque, uint64_t addr, uint64_t *data, 
     // }
 
     FemuCtrl *n = (FemuCtrl*)opaque;
+    struct buffer *buffer = &n->ssd->dram_buffer;
     assert(addr < n->mbe->size);
+    qatomic_inc(&buffer->cxl_mmio_read_callbacks);
     // qemu_mutex_lock(&n->mutex);
     // printf("[tid %d] read 0x%lx, size: %u\n", gettid(), addr, size);
     // if (cnt < 10) {
@@ -348,8 +279,11 @@ static MemTxResult cxlssd_mem_read(void *opaque, uint64_t addr, uint64_t *data, 
     //     return MEMTX_OK;
     // }
 
-    if(!n->cxl_skip_ftl)
+    if (!n->cxl_skip_ftl) {
         wait_for_buf_update(n, addr, CXL_READ);
+    } else {
+        qatomic_inc(&buffer->cxl_skip_ftl_bypasses);
+    }
     // qemu_mutex_unlock(&n->mutex);
     return MEMTX_OK;
 }
@@ -414,62 +348,54 @@ static MemTxResult cxlssd_mem_write(void *opaque, uint64_t addr, uint64_t data, 
 }
 
 #ifdef LSA_TROLL
-static void req_ftl(FemuCtrl *n, int c)
+static void req_ftl(FemuCtrl *n, int c, CylonFtlMapDigest *map_digest)
 {   
-    int rc;
-    struct nand_cmd cmd = (struct nand_cmd) {
-        .type = USER_IO,
-        .cmd = c,
-        .stime = 0,
-    };
-    
-    struct cxl_req creq = (struct cxl_req) {
-        .ncmd = &cmd,
-        .lpn = 0,
-        .expire_time = 0,
-    };
-    
-    struct cxl_req *myreq = &creq;
-    struct cxl_req *req = NULL;
+    struct cxl_req *myreq = cxl_request_new(c, 0, 0,
+                                            map_digest != NULL);
 
-    /* send requesst*/
-    rc = femu_ring_enqueue(n->cxl_req, (void *)&myreq, 1);
-    if (rc != 1) {
-        femu_err("enqueue failed, ret=%d\n", rc);
+    /* Send the control request and wait for the FTL-side barrier. */
+    cxl_request_enqueue(n, myreq);
+    if (!cylon_cxl_request_wait(&myreq->lifetime)) {
+        femu_err("CXL control wait state differs: seq=%" PRIu64
+                 " state=%u\n", myreq->lifetime.sequence,
+                 cylon_cxl_request_state(&myreq->lifetime));
+        abort();
     }
 
-    pqueue_t *pq = n->cxl_pq;
-    struct rte_ring *rp = n->cxl_resp;
-    bool recvd = false;
-
-    while (!recvd) {
-        /* flush response Q */
-        while (femu_ring_count(rp)) {
-            req = NULL;
-            rc = femu_ring_dequeue(rp, (void *)&req, 1);
-            if (rc != 1) {
-                femu_err("dequeue from to_poller request failed\n");
-            }
-            assert(req);
-            
-            pqueue_insert(pq, req);
-        }
-
-        /* Wait for my response */
-        while ((req = pqueue_peek(pq))) {
-            if (myreq != req)
-                continue;
-
-            recvd = true;
-            pqueue_pop(pq);
-            break;
-        }
+    if (map_digest) {
+        *map_digest = myreq->map_digest;
     }
+    cylon_cxl_req_put(myreq);
 }
 #endif
 
-char policy_str[5][10] = {"NONE", "LIFO", "FIFO", "CLOCK", "S3FIFO"};
-#define PRINT_BUFFER_POLICY fprintf(f,"NAND size: %d MB, Buffer size: %d MB, eviction: %s, prefetch: %d, way: %d, == %ld ==\n", n->memsz, n->bufsz, buffer->policy<POLICY_MAX? policy_str[buffer->policy]:"INVALID", buffer->degree, 1 << buffer->way, offset)
+static const char policy_str[5][10] = {
+    "NONE", "LIFO", "FIFO", "CLOCK", "S3FIFO"
+};
+
+static void format_buffer_way(const struct buffer *buffer, char *text,
+                              size_t text_size)
+{
+    if (buffer->way == WAY_FULL) {
+        snprintf(text, text_size, "full");
+    } else {
+        snprintf(text, text_size, "%u", 1U << buffer->way);
+    }
+}
+
+static void print_buffer_policy(FILE *stream, const FemuCtrl *n,
+                                const struct buffer *buffer, uint64_t offset)
+{
+    char way[32];
+    format_buffer_way(buffer, way, sizeof(way));
+    fprintf(stream,
+            "NAND size: %u MB, Buffer size: %u MB, eviction: %s, "
+            "prefetch: %d, way: %s, == %" PRIu64 " ==\n",
+            n->memsz, n->bufsz,
+            buffer->policy < POLICY_MAX ?
+                policy_str[buffer->policy] : "INVALID",
+            buffer->degree, way, offset);
+}
 
 
 static FILE *f = NULL;
@@ -485,50 +411,117 @@ static uint16_t get_lsa(struct FemuCtrl *n, void *buf, uint64_t size, uint64_t o
     assert(f != NULL);
     struct buffer *buffer = &n->ssd->dram_buffer;
     switch(size) {
-    case 1://print hit/miss count
-        // req_ftl(n, BUF_PRINT_STAT);
-        fprintf(f,"NAND size: %d MB, Buffer size: %d MB, eviction: %s, prefetch: %d, way: %d, == %ld ==\n", n->memsz, n->bufsz, buffer->policy<POLICY_MAX? policy_str[buffer->policy]:"INVALID", buffer->degree, 1 << buffer->way, offset);
-        fprintf(f,"Entry cnt: %ld/%ld\n", buffer->entry_cnt, buffer->size);
-        fprintf(f,"Buffer read: %lu hit/ %lu miss\n", buffer->read_hit, buffer->read_miss);
-        fprintf(f,"Buffer write: %lu hit/ %lu miss\n", buffer->write_hit, buffer->write_miss);
+    case 1: { //print hit/miss count
+        CylonFtlMapDigest map_digest;
+        uint64_t mmio_read_callbacks;
+        uint64_t skip_ftl_bypasses;
+        uint64_t mapped_nand_reads;
+        uint64_t unmapped_read_alloc_writes;
+        uint64_t modeled_nand_wait_ns;
+
+        req_ftl(n, BUF_PRINT_STAT, NULL);
+        req_ftl(n, FTL_MAP_DIGEST, &map_digest);
+        mmio_read_callbacks =
+            qatomic_xchg(&buffer->cxl_mmio_read_callbacks, 0);
+        skip_ftl_bypasses =
+            qatomic_xchg(&buffer->cxl_skip_ftl_bypasses, 0);
+        mapped_nand_reads =
+            qatomic_xchg(&buffer->cxl_mapped_nand_reads, 0);
+        unmapped_read_alloc_writes =
+            qatomic_xchg(&buffer->cxl_unmapped_read_alloc_writes, 0);
+        modeled_nand_wait_ns =
+            qatomic_xchg(&buffer->cxl_modeled_nand_wait_ns, 0);
+        print_buffer_policy(f, n, buffer, offset);
+        fprintf(f,"Entry cnt: %" PRIu64 "/%" PRIu64 "\n",
+                buffer->entry_cnt, buffer->size);
+        fprintf(f,"Buffer read: %" PRIu64 " hit/ %" PRIu64 " miss\n",
+                buffer->read_hit, buffer->read_miss);
+        fprintf(f,"Buffer write: %" PRIu64 " hit/ %" PRIu64 " miss\n",
+                buffer->write_hit, buffer->write_miss);
+        fprintf(f,"Buffer ops: %" PRIu64 " insert/ %" PRIu64 " evict\n",
+                buffer->ins_cnt, buffer->evict_cnt);
+        fprintf(f,"Victim LPNs (%" PRIu64 " captured, %" PRIu64 " dropped):",
+                buffer->victim_trace_count, buffer->victim_trace_dropped);
+        for (uint64_t i = 0; i < buffer->victim_trace_count; i++) {
+            fprintf(f," %" PRIu64, buffer->victim_trace[i]);
+        }
+        fprintf(f,"\n");
+        fprintf(f,
+                "CXL path: mmio_read_callbacks=%" PRIu64
+                " skip_ftl_bypasses=%" PRIu64
+                " mapped_nand_reads=%" PRIu64
+                " unmapped_read_alloc_writes=%" PRIu64
+                " modeled_nand_wait_ns=%" PRIu64 "\n",
+                mmio_read_callbacks, skip_ftl_bypasses,
+                mapped_nand_reads, unmapped_read_alloc_writes,
+                modeled_nand_wait_ns);
+        /* Append after the legacy seven-line stats block. */
+        fprintf(f,
+                "FTL mapping digest: schema=%s sha256=%s"
+                " lpn_count=%" PRIu64 " mapped=%" PRIu64
+                " unmapped=%" PRIu64 " ppa_bytes=%u\n",
+                CYLON_FTL_MAP_DIGEST_SCHEMA, map_digest.sha256,
+                map_digest.lpn_count, map_digest.mapped_count,
+                map_digest.unmapped_count,
+                CYLON_FTL_MAP_DIGEST_PPA_BYTES);
         buffer->ins_cnt = buffer->evict_cnt = buffer->read_hit = buffer->read_miss = buffer->write_hit = buffer->write_miss = 0;
+        buffer->victim_trace_count = 0;
+        buffer->victim_trace_dropped = 0;
 
         break;
+    }
     case 2://flush buffer
         printf("flush buffer ");
-        req_ftl(n, BUF_CLEAR);
+        req_ftl(n, BUF_CLEAR, NULL);
         // printf("done\n");
         break;
-    case 3: //set way
+    case 3: { //set way
         // fprintf(f,"====================\n\n");
+        if (offset > WAY_FULL) {
+            fprintf(f, "[Set way rejected] invalid way code: %" PRIu64 "\n",
+                    offset);
+            break;
+        }
+        /*
+         * Runtime way changes are debug-only and must be issued while no
+         * workload is running.  Drain earlier FTL requests before replacing
+         * the set array.
+         */
+        req_ftl(n, BUF_PRINT_STAT, NULL);
         buffer_clear(buffer);
         buffer_destroy_set(buffer);
 
         buffer->way = offset;
         buffer_init_set(buffer);
-        fprintf(f,"[Set way] eviction: %s, prefetch: %d, way: %d\n", buffer->policy==LIFO? "LIFO":"FIFO", buffer->degree, 1 << buffer->way);
+        char way[32];
+        format_buffer_way(buffer, way, sizeof(way));
+        fprintf(f,"[Set way] eviction: %s, prefetch: %d, way: %s\n",
+                buffer->policy < POLICY_MAX ?
+                    policy_str[buffer->policy] : "INVALID",
+                buffer->degree, way);
 
         break;
+    }
     case 5: //set prefetch degree
         buffer->degree = offset;
         fprintf(f,"[Set degree] \n\t");
-        PRINT_BUFFER_POLICY;
+        print_buffer_policy(f, n, buffer, offset);
         break;
     case 7: //set prefetch stride
         buffer->stride = offset;
         fprintf(f,"[Set stride] \n\t");
-        PRINT_BUFFER_POLICY;
+        print_buffer_policy(f, n, buffer, offset);
         break;
     case 9:
         // femu_kvm_spte_clear_mmio_flag(0x1200, (uint64_t)(n->mbe->logical_space) + (0x1200<<12));
         printf("turn on ioctl flag set\n");
-        req_ftl(n, BUF_CLEAR);
+        req_ftl(n, BUF_CLEAR, NULL);
         ioctl_flag = true;
         break;
     case 11:
         // femu_kvm_spte_set_mmio_flag(0x1200, (uint64_t)(n->mbe->logical_space) + (0x1200<<12));
         printf("turn off ioctl flag set\n");
-        req_ftl(n, BUF_CLEAR);
+        req_ftl(n, BUF_CLEAR, NULL);
         ioctl_flag = false;
         break;
     
@@ -659,4 +652,3 @@ int nvme_register_cxlssd(FemuCtrl *n)
     };
     return 0;
 }
-

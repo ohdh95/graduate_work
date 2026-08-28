@@ -1401,8 +1401,6 @@ typedef struct FemuCtrl {
     pqueue_t        **pq;
     
     struct rte_ring *cxl_req;
-    struct rte_ring *cxl_resp;
-    pqueue_t        *cxl_pq;
 
     bool            *should_isr;
     bool            poller_on;
